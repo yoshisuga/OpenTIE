@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef TIE_IOS
+#include "tie_app/ios/ios_app.h"
+#endif
+
 static TieAppConfigState* g_current_config;
 static const char* const mouse_modes[] = { "virtual_stick", "classic" };
 
@@ -441,6 +445,12 @@ static bool TieAppConfig_ParseComplete(const AeronConfigFile* document,
 								 sizeof out->sc55_rom_directory, error, capacity) ||
 		!TieAppConfig_ReadString(document, "ui.font", out->ui.font, sizeof out->ui.font, error, capacity))
 		return false;
+#ifdef TIE_IOS
+	TieIos_RebaseDocumentsPath(out->tie95_data, sizeof out->tie95_data);
+	TieIos_RebaseDocumentsPath(out->tie98_data, sizeof out->tie98_data);
+	TieIos_RebaseDocumentsPath(out->fluidsynth_soundfont_file, sizeof out->fluidsynth_soundfont_file);
+	TieIos_RebaseDocumentsPath(out->sc55_rom_directory, sizeof out->sc55_rom_directory);
+#endif
 	if (!TieAppConfig_ValidateResourcePath("ui.font", out->ui.font, error, capacity))
 		return false;
 	midi_backend = AeronConfigFile_GetString(document, "audio.midi_backend", NULL);

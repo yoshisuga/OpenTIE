@@ -6,6 +6,9 @@ project(tie C)
 
 # Enable C++ for transitive CXX dependencies; the engine remains C.
 enable_language(CXX)
+if(IOS)
+    enable_language(OBJC)
+endif()
 set(CMAKE_CXX_STANDARD 17)
 
 include(cmake/CompilerCache.cmake)

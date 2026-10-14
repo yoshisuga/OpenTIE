@@ -94,3 +94,10 @@ void TieUserTiming_ApplyThrottleCommand(void) {
 		pstate.player_craft->throttle_speed = (uint16_t)inputthrottle;
 	inputthrottle = UINT32_MAX;
 }
+
+bool TieUserTiming_PlayerThrottle(uint16_t* out) {
+	if (!out || !pstate.player_craft)
+		return false;
+	*out = pstate.player_craft->throttle_speed;
+	return true;
+}

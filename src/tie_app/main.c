@@ -1,6 +1,9 @@
 #include "tie_app/application.h"
 
 #include "aeron/main.h"
+#ifdef TIE_IOS
+#include "tie_app/ios/ios_app.h"
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -49,5 +52,9 @@ static int TieMain_ParseOptions(int argc, char* argv[], TieLaunchOptions* out) {
 int main(int argc, char* argv[]) {
 	TieLaunchOptions launch;
 	const int status = TieMain_ParseOptions(argc, argv, &launch);
+#ifdef TIE_IOS
+	if (!status)
+		TieIos_FindInstallations(&launch);
+#endif
 	return status ? status : TieApplication_Run(&launch);
 }

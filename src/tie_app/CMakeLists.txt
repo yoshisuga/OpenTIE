@@ -78,7 +78,45 @@ if(NOT APPLE)
         VERBATIM)
 endif()
 
-if(APPLE)
+if(IOS)
+    # An iOS bundle is flat: SDL_GetBasePath is the bundle root, which holds
+    # the tie_resources and shaders directories, and SDL3 in Frameworks.
+    set(TIE_IOS_BUILD_VERSION "1" CACHE STRING "OpenTIE iOS bundle build version")
+    set(TIE_IOS_BUNDLE_IDENTIFIER "org.totallyopen.opentie" CACHE STRING
+        "OpenTIE iOS bundle identifier")
+    if(TIE_VERSION MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)")
+        set(TIE_IOS_SHORT_VERSION "${CMAKE_MATCH_1}")
+    else()
+        set(TIE_IOS_SHORT_VERSION "0.0.0")
+    endif()
+    if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+        set(TIE_IOS_PLATFORM "iPhoneSimulator")
+    else()
+        set(TIE_IOS_PLATFORM "iPhoneOS")
+    endif()
+    target_sources(tie PRIVATE ios/ios_app.h ios/ios_app.m)
+    set_source_files_properties(ios/ios_app.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(tie PRIVATE TIE_IOS=1)
+    # FFmpeg's static libavutil needs the Core frameworks its pkg-config names.
+    target_link_libraries(tie PRIVATE "-framework Foundation" "-framework UIKit"
+        "-framework CoreGraphics" "-framework QuartzCore"
+        "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreMedia")
+    set_target_properties(tie PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/cmake/ios/Info.plist.in"
+        BUILD_RPATH "@executable_path/Frameworks"
+        INSTALL_RPATH "@executable_path/Frameworks")
+    add_custom_command(TARGET tie POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            "-DTIE_BUNDLE_DIR=$<TARGET_BUNDLE_CONTENT_DIR:tie>"
+            "-DTIE_SHADER_SOURCE_DIR=${TIE_SHADER_BINARY_DIR}"
+            "-DTIE_RESOURCE_SOURCE_DIR=${CMAKE_SOURCE_DIR}/resources"
+            "-DTIE_AERON_DEFAULTS=${CMAKE_SOURCE_DIR}/aeron/config/scene3d_defaults.yaml"
+            "-DTIE_ICON_SOURCE=${CMAKE_SOURCE_DIR}/packaging/icons/opentie-icon.png"
+            -P "${CMAKE_SOURCE_DIR}/cmake/ios/StageBundle.cmake"
+        COMMENT "Staging OpenTIE iOS resources and shaders"
+        VERBATIM)
+elseif(APPLE)
     set(TIE_MACOS_BUILD_VERSION "1" CACHE STRING "OpenTIE macOS bundle build version")
     if(NOT DEFINED TIE_MACOS_BUNDLE_IDENTIFIER)
         set(TIE_MACOS_BUNDLE_IDENTIFIER "org.totallyopen.opentie" CACHE STRING

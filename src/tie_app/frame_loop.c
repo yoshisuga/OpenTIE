@@ -22,6 +22,9 @@
 #include "tie_runtime/runtime/profile.h"
 #include "tie_runtime/runtime/runtime.h"
 #include "tie_runtime/snapshot/snapshot.h"
+#ifdef TIE_IOS
+#include "tie_app/ios/ios_app.h"
+#endif
 
 static uint64_t TieFrameLoop_PresentationIntervalUs(void) {
 	const double rate = Aeron_PresentationRate();
@@ -144,6 +147,9 @@ void TieFrameLoop_Run(void) {
 			TieRuntime_RequestExit();
 
 		const AeronInputSnapshot* input = Aeron_InputSnapshot();
+#ifdef TIE_IOS
+		TieIos_Frame();
+#endif
 		TieFrameLoop_DiscoverControllers(input);
 		const bool focus_paused = TieFrameLoop_UpdateFocus(input, &ever_had_focus);
 		TieFrameLoop_UpdatePresentation(input, delta_us);

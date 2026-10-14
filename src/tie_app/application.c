@@ -26,6 +26,9 @@
 #include "tie_app/setup/installation.h"
 #include "tie_app/setup/setup.h"
 #include "tie_app/ui.h"
+#ifdef TIE_IOS
+#include "tie_app/ios/ios_app.h"
+#endif
 #include "tie_remaster/remaster.h"
 #include "tie_runtime/flight_assets/service.h"
 #include "tie_runtime/hooks/axis_input.h"
@@ -81,7 +84,13 @@ static AeronConfig TieApplication_AeronConfig(const TieLaunchOptions* launch) {
 	config.org_name = "TotallyOpen";
 	config.app_name = "OpenTIE";
 	config.resource_root = launch->resource_root;
+#ifdef TIE_IOS
+	/* codesign reads a "resources" directory in the flat iOS bundle as a
+	 * macOS-style Resources directory and rejects the bundle. */
+	config.resource_path = "tie_resources";
+#else
 	config.resource_path = "resources";
+#endif
 	config.shader_path = TIE_SHADER_RELATIVE_DIR;
 	config.window_title = "OpenTIE";
 	config.window_icon_bmp = tie_window_icon_bmp;
@@ -116,6 +125,9 @@ static void TieApplication_Shutdown(AeronVfs* vfs, TieAppConfigState* config,
 	TieInstallation_SetClose(installations);
 	TieUi_Shutdown(ui);
 	TieAppConfig_Destroy(config);
+#ifdef TIE_IOS
+	TieIos_Shutdown();
+#endif
 	Aeron_Shutdown();
 }
 
@@ -145,6 +157,9 @@ int TieApplication_Run(const TieLaunchOptions* launch) {
 	 * synchronous startup work, then service the events queued by Aeron_Init. */
 	Aeron_RaiseWindow();
 	Aeron_PumpEvents();
+#ifdef TIE_IOS
+	TieIos_Init();
+#endif
 	/* Establish cursor visibility after activation events, which may alter the
 	 * platform cursor state. This also makes the cached state authoritative. */
 	TieInput_SyncSystemCursor(false);

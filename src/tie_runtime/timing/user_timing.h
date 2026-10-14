@@ -13,5 +13,7 @@ int16_t TieUserTiming_SlewAxis(int16_t current, int16_t target, unsigned int axi
 bool TieUserTiming_ThrottleCommandEligible(void);
 /* Apply this frame's absolute throttle command (if any) and clear it. */
 void TieUserTiming_ApplyThrottleCommand(void);
+/* The player craft's throttle, 0..UINT16_MAX; false without a player craft. */
+bool TieUserTiming_PlayerThrottle(uint16_t* out);
 
 #endif

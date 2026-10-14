@@ -1,0 +1,16 @@
+diff --git a/src/gpu/metal/SDL_gpu_metal.m b/src/gpu/metal/SDL_gpu_metal.m
+index 3750ffa..8c8b39f 100644
+--- a/src/gpu/metal/SDL_gpu_metal.m
++++ b/src/gpu/metal/SDL_gpu_metal.m
+@@ -4564,6 +4564,11 @@ static void METAL_INTERNAL_DestroyBlitResources(
+ #else
+         if (@available(iOS 13.0, tvOS 13.0, *)) {
+             hasHardwareSupport = [device supportsFamily:MTLGPUFamilyApple3];
++#if TARGET_OS_SIMULATOR
++            /* The simulator runs on the Mac's GPU but reports only the
++             * Apple2 family. */
++            hasHardwareSupport = hasHardwareSupport || [device supportsFamily:MTLGPUFamilyApple2];
++#endif
+         }
+ #endif
+ 
