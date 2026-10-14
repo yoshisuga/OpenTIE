@@ -78,6 +78,7 @@
 #include "tie_runtime/timing/flight_clock.h"
 #include "tie_runtime/timing/flight_timing.h"
 #include "tie_runtime/timing/flight_timing_state.h"
+#include "tie_runtime/runtime/quicksave.h"
 #include "tie_runtime/timing/replay_timing.h"
 #include "tie_runtime/timing/sim_clock.h" /* TieSimClock_NowUs — loading-screen minimum hold */
 #include "util/binio.h"
@@ -145,6 +146,14 @@ static LandruTaskStepResult flight_mission_step(void* self) {
 		TieInflightInfo_Begin(pending);
 		t->rebase_pending = 1;
 		return LANDRU_TASK_STEP_CONTINUE;
+	}
+
+	/* Quick save and load happen here, between frames, where the replay
+	 * viewer saved and restored the live flight. A load moves the flight
+	 * clock, so rebase it as after the viewer. */
+	if (TieQuickSave_Service()) {
+		TieFlightClock_Rebase();
+		tickcounter = 0;
 	}
 
 	/* Pending replay-viewer request from the 'v' keybind? Push the
