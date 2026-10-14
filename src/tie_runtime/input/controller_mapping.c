@@ -3,6 +3,7 @@
 #include "tie_runtime/input/keyboard_mapping.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Physical holds are independent even when several instances share a profile. */
@@ -417,6 +418,10 @@ static void SampleAnalog(size_t index, const AeronControllerSnapshot* d, TieInpu
 			int value = ((int32_t)raw * 127) / 32767;
 			if (value < -127)
 				value = -127;
+			/* With several controllers connected, the one deflected furthest
+			 * steers, so an idle controller cannot hold another at center. */
+			if (mapping->axes[axis].source >= 0 && abs(value) <= abs(g_controller.axes[axis]))
+				continue;
 			/* Landru also reads these slots for its menu cursor. Flight polarity
 			 * belongs in TieInputMapping, which only feinput_getrawinput applies. */
 			g_controller.axes[axis] = (int16_t)value;
