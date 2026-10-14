@@ -22,21 +22,35 @@ included.
   4:3 picture; on a screen without bars they overlap its edges.
   - **Flying:** put a thumb down anywhere outside the buttons and drag; that
     is the flight stick. It drives a virtual SDL gamepad, so it uses the
-    gamepad's axis settings.
-  - **Right bar:** THR+ and THR− (hold to repeat), WPN, LINK, NEAR, ATKR,
-    TGT◀ and TGT▶, MATCH, ROLL and FIRE. Hold ROLL and use the stick to roll
-    and set the throttle, as with a joystick's second button; a tap targets
-    the craft under the sight.
-  - **Left bar:** ESC, KEYS (the screen keyboard), a throttle slider, and two
-    panels that fold away: PWR (laser, shield and beam recharge rates,
-    transfers between lasers and shields, shield mode, beam on/off) and MEM
-    (target memories T1–T3: tap to recall, hold to store). The engines get
-    the power the recharge rates leave, as in the original. The panels stay
-    open or closed between launches.
-  - **Top row:** PAUSE, OK (confirm), TGT VIEW (the target viewer), and
-    submenus INFO (map, goals, messages, damage), VIEW (cockpit, external
-    camera and its controls, missile camera) and CMD (wingman orders,
-    reinforcements, hyperspace). One submenu opens at a time.
+    gamepad's axis settings. GYRO adds the phone's turning to it: the ship
+    turns as fast as the phone does and stops when it stops.
+  - **Wheels:** buttons marked with a short arc on their outline do one thing
+    on a tap and open a wheel when held (an amber ring fills as you hold) or
+    slid off. Release on a choice to take it, or in the middle (✕) to cancel.
+    Choices shown in red, such as eject and loading a checkpoint, must be
+    rested on until they turn bright red. The phone ticks as the choice
+    changes.
+  - **Right bar:** THR+ and THR− (hold to repeat), WPN, LINK, MATCH, ROLL,
+    TGT and FIRE. TGT takes the next target on a tap; its wheel has the
+    nearest craft, my attacker, my target's attacker, the newest craft, the
+    target viewer, components, clear and previous. Hold ROLL and use the
+    stick to roll and set the throttle, as with a joystick's second button.
+  - **Left bar:** ESC, KEYS (the screen keyboard), PWR, MEM, GYRO and a
+    throttle slider. PWR and MEM open panels: laser, shield and beam
+    recharge rates, transfers between lasers and shields, shield mode and
+    beam on/off; and target memories T1–T3 (tap to recall, hold to store).
+    The engines get the power the recharge rates leave, as in the original.
+  - **Top row:** PAUSE, OK (confirm), submenus INFO (map, goals, messages,
+    damage), VIEW (cockpit, external camera and its controls, missile camera,
+    and LOOK: forward on a tap, a wheel of the views all around) and CMD
+    (wingman orders, reinforcements, hyperspace), then two wheels. MISSION
+    cycles time compression on a tap; its wheel has hyperspace, the flight
+    recorder, eject and end mission. CHKPT saves a checkpoint to the slot
+    used last; its wheel saves to and loads slots 1–3.
+  - **Checkpoints:** a checkpoint is the flight recorder's own snapshot of the
+    flight, with the random-number state, kept for the mission it was saved
+    in (`src/tie_runtime/runtime/quicksave.c`). A slot from another mission is
+    shown empty.
   - **Menus and briefings:** ESC, KEYS and SKIP; tap anywhere else to click.
     A tap ends the current cutscene scene; SKIP (Enter) skips the sequence.
   - **Paused:** PAUSE stays to resume.
@@ -104,7 +118,5 @@ in the setup window or in OpenTIE Settings.
 ## Not done yet
 
 - FluidSynth (OPL3 and SC-55 MIDI work)
-- gyro aiming
-- time compression, component targeting and other less common keys on the
-  touch screen
+- checkpoints that survive leaving the mission
 - moving and resizing the touch buttons

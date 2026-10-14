@@ -99,7 +99,7 @@ if(IOS)
     target_compile_definitions(tie PRIVATE TIE_IOS=1)
     # FFmpeg's static libavutil needs the Core frameworks its pkg-config names.
     target_link_libraries(tie PRIVATE "-framework Foundation" "-framework UIKit"
-        "-framework CoreGraphics" "-framework QuartzCore"
+        "-framework CoreGraphics" "-framework CoreMotion" "-framework QuartzCore"
         "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreMedia")
     set_target_properties(tie PROPERTIES
         MACOSX_BUNDLE TRUE

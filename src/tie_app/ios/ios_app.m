@@ -20,11 +20,13 @@
 #include "tie_runtime/presentation/presentation.h"
 #include "tie_runtime/runtime/flight_requests.h"
 #include "tie_runtime/runtime/flight_screen.h"
+#include "tie_runtime/runtime/quicksave.h"
 #include "tie_runtime/snapshot/snapshot.h"
 #include "tie_runtime/timing/user_timing.h"
 
 #include <SDL3/SDL.h>
 
+#import <CoreMotion/CoreMotion.h>
 #import <UIKit/UIKit.h>
 
 #include <math.h>
@@ -150,11 +152,69 @@ static void TieIos_DetachGamepad(void) {
 	ios_gamepad = NULL;
 }
 
-static void TieIos_SetStick(float x, float y) {
+/* The flight stick is the touch stick plus the gyro, each -1..1. */
+static float ios_touch_x, ios_touch_y;
+static float ios_gyro_x, ios_gyro_y;
+
+static void TieIos_ApplyStick(void) {
 	if (!ios_gamepad)
 		return;
+	const float x = fmaxf(-1.0f, fminf(1.0f, ios_touch_x + ios_gyro_x));
+	const float y = fmaxf(-1.0f, fminf(1.0f, ios_touch_y + ios_gyro_y));
 	SDL_SetJoystickVirtualAxis(ios_gamepad, SDL_GAMEPAD_AXIS_LEFTX, (Sint16)lroundf(x * SDL_JOYSTICK_AXIS_MAX));
 	SDL_SetJoystickVirtualAxis(ios_gamepad, SDL_GAMEPAD_AXIS_LEFTY, (Sint16)lroundf(y * SDL_JOYSTICK_AXIS_MAX));
+}
+
+static void TieIos_SetStick(float x, float y) {
+	ios_touch_x = x;
+	ios_touch_y = y;
+	TieIos_ApplyStick();
+}
+
+/* ---------------- Gyro aiming ---------------- */
+
+/* Turning the phone turns the ship: the gyro's rotation rate deflects the
+ * stick, so the ship follows the phone and stops when it stops, with no
+ * drift to recenter. */
+static CMMotionManager* ios_motion;
+static bool ios_gyro_on;
+static NSString* const TieIosGyroKey = @"TieIosGyro";
+static const double TIE_IOS_GYRO_FULL_RATE = 1.5;  /* rad/s for a full deflection */
+static const double TIE_IOS_GYRO_DEADZONE = 0.03; /* rad/s of hand tremor ignored */
+
+static void TieIos_SetGyro(bool on) {
+	ios_gyro_on = on;
+	[[NSUserDefaults standardUserDefaults] setBool:on forKey:TieIosGyroKey];
+	if (!ios_motion)
+		ios_motion = [[CMMotionManager alloc] init];
+	if (on && ios_motion.deviceMotionAvailable) {
+		ios_motion.deviceMotionUpdateInterval = 1.0 / 60.0;
+		[ios_motion startDeviceMotionUpdates];
+	} else {
+		[ios_motion stopDeviceMotionUpdates];
+	}
+}
+
+static double TieIos_GyroAxis(double rate) {
+	if (fabs(rate) < TIE_IOS_GYRO_DEADZONE)
+		return 0.0;
+	return (rate - copysign(TIE_IOS_GYRO_DEADZONE, rate)) / TIE_IOS_GYRO_FULL_RATE;
+}
+
+/* Rotation about the screen's vertical axis yaws; about its horizontal axis
+ * pitches. Which device axis is which depends on the landscape side. */
+static void TieIos_UpdateGyro(bool flight, UIInterfaceOrientation orientation) {
+	CMDeviceMotion* motion = ios_gyro_on && flight ? ios_motion.deviceMotion : nil;
+	if (!motion) {
+		ios_gyro_x = ios_gyro_y = 0.0f;
+		return;
+	}
+	const CMRotationRate rate = motion.rotationRate;
+	const bool home_right = orientation == UIInterfaceOrientationLandscapeRight;
+	const double about_up = home_right ? rate.x : -rate.x;
+	const double about_right = home_right ? -rate.y : rate.y;
+	ios_gyro_x = (float)TieIos_GyroAxis(-about_up);
+	ios_gyro_y = (float)TieIos_GyroAxis(about_right);
 }
 
 /* The throttle slider drives the right stick's Y axis, 0..1. The shipped
@@ -200,6 +260,7 @@ typedef enum TieIosButtonKind {
 	TIE_IOS_BUTTON_KEYBOARD, /* shows or hides the screen keyboard */
 	TIE_IOS_BUTTON_TOGGLE,   /* opens or closes a group of buttons */
 	TIE_IOS_BUTTON_ENTER,    /* the Enter key */
+	TIE_IOS_BUTTON_WHEEL,    /* an action on a tap; hold or slide out for a wheel */
 } TieIosButtonKind;
 
 typedef enum TieIosButtonPlace {
@@ -209,6 +270,199 @@ typedef enum TieIosButtonPlace {
 } TieIosButtonPlace;
 
 static const CFTimeInterval TIE_IOS_HOLD_SECONDS = 0.5;
+static const CFTimeInterval TIE_IOS_WHEEL_SECONDS = 0.3;
+
+/* Haptics: a light tap as a wheel opens, a tick as its choice changes, a
+ * firmer tap when one is taken, and a success buzz when a hold stores. */
+static UIImpactFeedbackGenerator* ios_haptic_light;
+static UIImpactFeedbackGenerator* ios_haptic_medium;
+static UISelectionFeedbackGenerator* ios_haptic_select;
+static UINotificationFeedbackGenerator* ios_haptic_notify;
+
+static void TieIos_PrepareHaptics(void) {
+	if (!ios_haptic_light) {
+		ios_haptic_light = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+		ios_haptic_medium = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+		ios_haptic_select = [[UISelectionFeedbackGenerator alloc] init];
+		ios_haptic_notify = [[UINotificationFeedbackGenerator alloc] init];
+	}
+	[ios_haptic_light prepare];
+	[ios_haptic_select prepare];
+}
+
+/* ---------------- Choice wheel ---------------- */
+
+/* The ring of choices a wheel button opens. The choice under the finger is
+ * picked when it lifts; the center, marked ✕, or anywhere short of the ring
+ * picks none. Nothing is picked until the finger has moved, and a dangerous
+ * choice (eject, end mission) must be held until it arms. */
+static const CGFloat TIE_IOS_WHEEL_MOVE = 14.0;     /* points before any pick */
+static const CFTimeInterval TIE_IOS_WHEEL_ARM = 0.6; /* seconds on a dangerous choice */
+
+@interface TieChoiceWheel : UIView
+@property(nonatomic, strong) NSArray<NSString*>* titles;
+@property(nonatomic, strong) NSIndexSet* dangerous;
+/* Choices shown dimmed that cannot be taken, such as an empty slot. */
+@property(nonatomic, strong) NSIndexSet* disabled;
+@property(nonatomic, strong) NSArray<UILabel*>* labels;
+@property(nonatomic, strong) UILabel* cancelLabel;
+@property(nonatomic, strong) CAShapeLayer* disc;
+@property(nonatomic) CGPoint hub;
+@property(nonatomic) CGPoint openPoint;
+@property(nonatomic) BOOL moved;
+@property(nonatomic) CGFloat radius;
+@property(nonatomic) NSInteger selection;
+@property(nonatomic) CFTimeInterval selectedAt;
+@property(nonatomic) BOOL armed;
+@end
+
+@implementation TieChoiceWheel
+
+- (instancetype)initWithFrame:(CGRect)frame {
+	if ((self = [super initWithFrame:frame])) {
+		self.userInteractionEnabled = NO;
+		self.hidden = YES;
+		self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+		_disc = [CAShapeLayer layer];
+		_disc.fillColor = [UIColor colorWithWhite:0.0 alpha:0.55].CGColor;
+		_disc.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
+		_disc.lineWidth = 1.5;
+		[self.layer addSublayer:_disc];
+		_cancelLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
+		_cancelLabel.text = @"✕";
+		_cancelLabel.textAlignment = NSTextAlignmentCenter;
+		_cancelLabel.font = [UIFont boldSystemFontOfSize:20.0];
+		_cancelLabel.layer.cornerRadius = 22.0;
+		_cancelLabel.layer.borderWidth = 1.5;
+		_cancelLabel.clipsToBounds = YES;
+		[self addSubview:_cancelLabel];
+	}
+	return self;
+}
+
+/* Opens around origin, moved in from the edges as needed; the finger starts
+ * at point. */
+- (void)showFrom:(CGPoint)origin
+		   finger:(CGPoint)point
+		   titles:(NSArray<NSString*>*)titles
+		dangerous:(NSIndexSet*)dangerous
+		 disabled:(NSIndexSet*)disabled {
+	for (UILabel* label in self.labels)
+		[label removeFromSuperview];
+	self.titles = titles;
+	self.dangerous = dangerous;
+	self.disabled = disabled;
+	self.openPoint = point;
+	self.moved = NO;
+	const CGSize size = self.bounds.size;
+	const CGSize pill = CGSizeMake(70.0, 30.0);
+	self.radius = MIN(110.0, size.height * 0.3);
+	const CGFloat reach = self.radius + pill.width / 2 + 4.0;
+	self.hub = CGPointMake(MAX(reach, MIN(origin.x, size.width - reach)),
+						   MAX(self.radius + pill.height, MIN(origin.y, size.height - self.radius - pill.height)));
+	NSMutableArray<UILabel*>* labels = [NSMutableArray array];
+	for (NSUInteger index = 0; index < titles.count; ++index) {
+		const CGFloat angle = -M_PI_2 + index * 2.0 * M_PI / titles.count;
+		UILabel* label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, pill.width, pill.height)];
+		label.center = CGPointMake(self.hub.x + cos(angle) * self.radius, self.hub.y + sin(angle) * self.radius);
+		label.text = titles[index];
+		label.textAlignment = NSTextAlignmentCenter;
+		label.font = [UIFont boldSystemFontOfSize:13.0];
+		label.adjustsFontSizeToFitWidth = YES;
+		label.minimumScaleFactor = 0.6;
+		label.textColor = UIColor.whiteColor;
+		label.alpha = [disabled containsIndex:index] ? 0.35 : 1.0;
+		label.layer.cornerRadius = pill.height / 2;
+		label.layer.borderWidth = 1.5;
+		label.layer.borderColor = [dangerous containsIndex:index]
+									  ? [UIColor colorWithRed:1.0 green:0.4 blue:0.35 alpha:0.9].CGColor
+									  : [UIColor colorWithWhite:1.0 alpha:0.6].CGColor;
+		label.clipsToBounds = YES;
+		[self addSubview:label];
+		[labels addObject:label];
+	}
+	self.labels = labels;
+	self.cancelLabel.center = self.hub;
+	self.disc.path = [UIBezierPath bezierPathWithArcCenter:self.hub
+													radius:self.radius + pill.height
+												startAngle:0
+												  endAngle:2 * M_PI
+												 clockwise:YES]
+						 .CGPath;
+	self.selection = -1;
+	self.armed = NO;
+	[self highlight];
+	self.hidden = NO;
+	[self.superview bringSubviewToFront:self];
+}
+
+- (void)track:(CGPoint)point {
+	if (!self.moved && hypot(point.x - self.openPoint.x, point.y - self.openPoint.y) < TIE_IOS_WHEEL_MOVE)
+		return;
+	self.moved = YES;
+	const CGFloat dx = point.x - self.hub.x, dy = point.y - self.hub.y;
+	NSInteger selection = -1;
+	if (hypot(dx, dy) > self.radius * 0.45 && self.titles.count) {
+		const CGFloat step = 2.0 * M_PI / self.titles.count;
+		const CGFloat angle = atan2(dy, dx) + M_PI_2;
+		selection = (NSInteger)lround(angle / step) % (NSInteger)self.titles.count;
+		if (selection < 0)
+			selection += self.titles.count;
+		if ([self.disabled containsIndex:selection])
+			selection = -1;
+	}
+	if (selection != self.selection) {
+		self.selection = selection;
+		self.selectedAt = CACurrentMediaTime();
+		self.armed = NO;
+		[self highlight];
+		if (selection >= 0) {
+			[ios_haptic_select selectionChanged];
+			[ios_haptic_select prepare];
+		}
+	}
+}
+
+/* Once per frame while open: a dangerous choice arms after a dwell. */
+- (void)tick:(CFTimeInterval)now {
+	if (self.selection < 0 || self.armed || ![self.dangerous containsIndex:self.selection] ||
+		now - self.selectedAt < TIE_IOS_WHEEL_ARM)
+		return;
+	self.armed = YES;
+	[ios_haptic_notify notificationOccurred:UINotificationFeedbackTypeWarning];
+	[self highlight];
+}
+
+/* The choice to take on release, or -1. */
+- (NSInteger)committed {
+	if (self.selection < 0 || ([self.dangerous containsIndex:self.selection] && !self.armed))
+		return -1;
+	return self.selection;
+}
+
+- (void)highlight {
+	for (NSUInteger index = 0; index < self.labels.count; ++index) {
+		UIColor* color = [UIColor colorWithWhite:0.2 alpha:0.8];
+		if ((NSInteger)index == self.selection) {
+			if (![self.dangerous containsIndex:index])
+				color = [UIColor colorWithRed:1.0 green:0.8 blue:0.3 alpha:0.75];
+			else
+				color = self.armed ? [UIColor colorWithRed:0.95 green:0.2 blue:0.15 alpha:0.9]
+								   : [UIColor colorWithRed:0.5 green:0.15 blue:0.12 alpha:0.85];
+		}
+		self.labels[index].backgroundColor = color;
+	}
+	const BOOL none = self.selection < 0;
+	self.cancelLabel.backgroundColor = none ? [UIColor colorWithWhite:1.0 alpha:0.3] : [UIColor colorWithWhite:0.2 alpha:0.8];
+	self.cancelLabel.textColor = [UIColor colorWithWhite:1.0 alpha:none ? 1.0 : 0.6];
+	self.cancelLabel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.6].CGColor;
+}
+
+- (void)dismiss {
+	self.hidden = YES;
+}
+
+@end
 
 @interface TieTouchButton : UIView
 @property(nonatomic) TieInputAction action;
@@ -221,6 +475,19 @@ static const CFTimeInterval TIE_IOS_HOLD_SECONDS = 0.5;
 @property(nonatomic) CFTimeInterval nextRepeat;
 @property(nonatomic, strong) UILabel* label;
 @property(nonatomic, copy) void (^toggle)(void);
+/* A wheel button's ring: titles and the actions they send. */
+@property(nonatomic, strong) NSArray<NSString*>* choiceTitles;
+@property(nonatomic, strong) NSIndexSet* dangerousChoices;
+/* Asked as the wheel opens: the choices to show dimmed. */
+@property(nonatomic, copy) NSIndexSet* (^disabledChoices)(void);
+@property(nonatomic) TieInputAction* choiceActions;
+@property(nonatomic, weak) TieChoiceWheel* wheel;
+@property(nonatomic) BOOL wheelOpen;
+@property(nonatomic) CGPoint lastPoint;
+/* Buttons with a hold: a short arc on the outline at rest, and a ring that
+ * fills around it while held, completing as the hold takes effect. */
+@property(nonatomic, strong) CAShapeLayer* holdMark;
+@property(nonatomic, strong) CAShapeLayer* holdRing;
 @end
 
 @implementation TieTouchButton
@@ -249,9 +516,68 @@ static const CFTimeInterval TIE_IOS_HOLD_SECONDS = 0.5;
 	return self;
 }
 
+- (BOOL)hasHold {
+	return self.kind == TIE_IOS_BUTTON_WHEEL || self.kind == TIE_IOS_BUTTON_TAP_HOLD;
+}
+
+- (CFTimeInterval)holdSeconds {
+	return self.kind == TIE_IOS_BUTTON_WHEEL ? TIE_IOS_WHEEL_SECONDS : TIE_IOS_HOLD_SECONDS;
+}
+
+- (void)layoutHoldLayers {
+	if (![self hasHold])
+		return;
+	if (!self.holdMark) {
+		self.holdMark = [CAShapeLayer layer];
+		self.holdMark.fillColor = UIColor.clearColor.CGColor;
+		self.holdMark.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.75].CGColor;
+		self.holdMark.lineWidth = 3.5;
+		self.holdMark.lineCap = kCALineCapRound;
+		[self.layer addSublayer:self.holdMark];
+		self.holdRing = [CAShapeLayer layer];
+		self.holdRing.fillColor = UIColor.clearColor.CGColor;
+		self.holdRing.strokeColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.3 alpha:0.95].CGColor;
+		self.holdRing.lineWidth = 3.0;
+		self.holdRing.strokeEnd = 0.0;
+		self.holdRing.hidden = YES;
+		[self.layer addSublayer:self.holdRing];
+	}
+	const CGRect bounds = self.bounds;
+	const CGFloat radius = MIN(bounds.size.width, bounds.size.height) * 0.5;
+	/* The lower-right quarter of the outline's right-hand curve. */
+	const CGPoint corner = CGPointMake(CGRectGetMaxX(bounds) - radius, CGRectGetMaxY(bounds) - radius);
+	self.holdMark.path = [UIBezierPath bezierPathWithArcCenter:corner
+														radius:radius - 0.75
+													startAngle:M_PI * 0.12
+													  endAngle:M_PI * 0.38
+													 clockwise:YES]
+							 .CGPath;
+	self.holdRing.path = [UIBezierPath bezierPathWithRoundedRect:CGRectInset(bounds, 1.5, 1.5)
+													cornerRadius:radius - 1.5]
+							 .CGPath;
+}
+
+/* Fill the ring over the hold time, or clear it. */
+- (void)showHoldProgress:(BOOL)holding {
+	if (!self.holdRing)
+		return;
+	[self.holdRing removeAllAnimations];
+	self.holdRing.hidden = !holding;
+	if (!holding)
+		return;
+	CABasicAnimation* fill = [CABasicAnimation animationWithKeyPath:@"strokeEnd"];
+	fill.fromValue = @0.0;
+	fill.toValue = @1.0;
+	fill.duration = [self holdSeconds];
+	fill.fillMode = kCAFillModeForwards;
+	fill.removedOnCompletion = NO;
+	[self.holdRing addAnimation:fill forKey:@"fill"];
+}
+
 - (void)layoutSubviews {
 	[super layoutSubviews];
 	self.layer.cornerRadius = MIN(self.bounds.size.width, self.bounds.size.height) * 0.5;
+	[self layoutHoldLayers];
 	_label.frame = CGRectInset(self.bounds, 4, 2);
 	_label.font = [UIFont boldSystemFontOfSize:MAX(9.0, MIN(self.bounds.size.height * 0.28, 20.0))];
 }
@@ -291,7 +617,37 @@ static void TieIos_ToggleKeyboard(void) {
 	SDL_DestroyProperties(props);
 }
 
+/* Wheel choices that are not input actions: saving to or loading a
+ * checkpoint slot, and saving to the slot used last. */
+enum {
+	TIE_IOS_CHOICE_SAVE = TIE_INPUT_ACTION_COUNT + 1,
+	TIE_IOS_CHOICE_LOAD = TIE_IOS_CHOICE_SAVE + TIE_QUICKSAVE_SLOTS,
+	TIE_IOS_CHOICE_SAVE_LAST = TIE_IOS_CHOICE_LOAD + TIE_QUICKSAVE_SLOTS,
+};
+
+static NSString* const TieIosCheckpointSlotKey = @"TieIosCheckpointSlot";
+
+static int TieIos_LastCheckpointSlot(void) {
+	const NSInteger slot = [[NSUserDefaults standardUserDefaults] integerForKey:TieIosCheckpointSlotKey];
+	return slot >= 1 && slot <= TIE_QUICKSAVE_SLOTS ? (int)slot : 1;
+}
+
 static void TieIos_Tap(TieInputAction action) {
+	const int choice = (int)action;
+	if (choice == TIE_IOS_CHOICE_SAVE_LAST) {
+		TieQuickSave_RequestSave(TieIos_LastCheckpointSlot());
+		return;
+	}
+	if (choice >= TIE_IOS_CHOICE_SAVE && choice < TIE_IOS_CHOICE_SAVE_LAST) {
+		const bool save = choice < TIE_IOS_CHOICE_LOAD;
+		const int slot = choice - (save ? TIE_IOS_CHOICE_SAVE : TIE_IOS_CHOICE_LOAD) + 1;
+		[[NSUserDefaults standardUserDefaults] setInteger:slot forKey:TieIosCheckpointSlotKey];
+		if (save)
+			TieQuickSave_RequestSave(slot);
+		else
+			TieQuickSave_RequestLoad(slot);
+		return;
+	}
 	TieInputActions_DispatchController(action, true);
 	TieInputActions_DispatchController(action, false);
 }
@@ -300,6 +656,9 @@ static void TieIos_Tap(TieInputAction action) {
 	if (down == self.held)
 		return;
 	self.held = down;
+	[self showHoldProgress:down && [self hasHold]];
+	if (down && [self hasHold])
+		TieIos_PrepareHaptics();
 	switch (self.kind) {
 		case TIE_IOS_BUTTON_KEYBOARD:
 			if (down)
@@ -312,6 +671,22 @@ static void TieIos_Tap(TieInputAction action) {
 		case TIE_IOS_BUTTON_ENTER:
 			if (down)
 				TieInput_EnqueueKey(13);
+			break;
+		case TIE_IOS_BUTTON_WHEEL:
+			if (down) {
+				self.pressTime = CACurrentMediaTime();
+				self.wheelOpen = NO;
+			} else if (self.wheelOpen) {
+				const NSInteger choice = [self.wheel committed];
+				[self.wheel dismiss];
+				self.wheelOpen = NO;
+				if (choice >= 0 && (NSUInteger)choice < self.choiceTitles.count) {
+					[ios_haptic_medium impactOccurred];
+					TieIos_Tap(self.choiceActions[choice]);
+				}
+			} else {
+				TieIos_Tap(self.action);
+			}
 			break;
 		case TIE_IOS_BUTTON_TAP_HOLD:
 			/* The hold fires from -tick:; a release before then is a tap. */
@@ -332,12 +707,31 @@ static void TieIos_Tap(TieInputAction action) {
 	}
 }
 
-/* Once per frame: repeats and holds. */
+- (void)openWheel {
+	if (self.wheelOpen || !self.wheel)
+		return;
+	self.wheelOpen = YES;
+	[self showHoldProgress:NO];
+	[ios_haptic_light impactOccurred];
+	[self.wheel showFrom:[self.superview convertPoint:self.center toView:self.wheel]
+				  finger:self.lastPoint
+				  titles:self.choiceTitles
+			   dangerous:self.dangerousChoices ? self.dangerousChoices : [NSIndexSet indexSet]
+				disabled:self.disabledChoices ? self.disabledChoices() : [NSIndexSet indexSet]];
+}
+
+/* Once per frame: repeats, holds and wheels. */
 - (void)tick:(CFTimeInterval)now {
 	if (!self.held)
 		return;
+	if (self.kind == TIE_IOS_BUTTON_WHEEL && now - self.pressTime >= TIE_IOS_WHEEL_SECONDS)
+		[self openWheel];
+	if (self.wheelOpen)
+		[self.wheel tick:now];
 	if (self.kind == TIE_IOS_BUTTON_TAP_HOLD && !self.holdFired && now - self.pressTime >= TIE_IOS_HOLD_SECONDS) {
 		self.holdFired = YES;
+		[ios_haptic_notify notificationOccurred:UINotificationFeedbackTypeSuccess];
+		[self showHoldProgress:NO];
 		TieIos_Tap(self.holdAction);
 		self.layer.borderColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:0.9].CGColor;
 	} else if (self.kind == TIE_IOS_BUTTON_REPEAT && now >= self.nextRepeat) {
@@ -350,7 +744,20 @@ static void TieIos_Tap(TieInputAction action) {
 
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
 	ios_controller_in_use = false;
+	self.lastPoint = [touches.anyObject locationInView:self.wheel];
 	[self press:YES];
+}
+
+/* A wheel opens early when the finger slides off the button. */
+- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+	if (self.kind != TIE_IOS_BUTTON_WHEEL)
+		return;
+	UITouch* touch = touches.anyObject;
+	self.lastPoint = [touch locationInView:self.wheel];
+	if (!self.wheelOpen && !CGRectContainsPoint(CGRectInset(self.bounds, -8, -8), [touch locationInView:self]))
+		[self openWheel];
+	if (self.wheelOpen)
+		[self.wheel track:self.lastPoint];
 }
 
 - (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
@@ -358,7 +765,15 @@ static void TieIos_Tap(TieInputAction action) {
 }
 
 - (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+	if (self.wheelOpen) {
+		[self.wheel dismiss];
+		self.wheel.selection = -1;
+	}
 	[self press:NO];
+}
+
+- (void)dealloc {
+	free(_choiceActions);
 }
 
 @end
@@ -485,6 +900,10 @@ static void TieIos_SetThrottleAxis(float value);
 @property(nonatomic) BOOL paused;
 @property(nonatomic, strong) TieTouchButton* pauseButton;
 @property(nonatomic, strong) TieTouchButton* skipButton;
+@property(nonatomic, strong) TieTouchButton* gyroButton;
+@property(nonatomic, strong) TieChoiceWheel* wheel;
+/* A short notice under the top row, such as a checkpoint's outcome. */
+@property(nonatomic, strong) UILabel* toast;
 /* The game picture as a fraction of the overlay's width; the buttons go in
  * the bars beside it. */
 @property(nonatomic) CGFloat gameX;
@@ -528,6 +947,21 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 	return button;
 }
 
+- (TieTouchButton*)wheelButton:(NSString*)title
+						  tap:(TieInputAction)tap
+					   titles:(NSArray<NSString*>*)titles
+					  actions:(const TieInputAction*)actions {
+	TieTouchButton* button = [[TieTouchButton alloc] initWithTitle:title
+															action:tap
+															  kind:TIE_IOS_BUTTON_WHEEL
+															 place:TIE_IOS_PLACE_FLIGHT];
+	button.choiceTitles = titles;
+	button.choiceActions = malloc(titles.count * sizeof *actions);
+	memcpy(button.choiceActions, actions, titles.count * sizeof *actions);
+	button.wheel = self.wheel;
+	return button;
+}
+
 - (TieTouchGroup*)groupWithTitle:(NSString*)title key:(NSString*)key buttons:(NSArray<TieTouchButton*>*)buttons {
 	TieTouchGroup* group = [[TieTouchGroup alloc] init];
 	group.key = key;
@@ -564,6 +998,7 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 		self.multipleTouchEnabled = YES;
 		self.backgroundColor = UIColor.clearColor;
 		self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+		_wheel = [[TieChoiceWheel alloc] initWithFrame:self.bounds];
 
 		TieTouchButton* escape = [[TieTouchButton alloc] initWithTitle:@"ESC"
 																action:TIE_INPUT_ACTION_ESCAPE
@@ -604,23 +1039,56 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 													 action:TIE_INPUT_ACTION_NONE
 													   kind:TIE_IOS_BUTTON_ENTER
 													  place:TIE_IOS_PLACE_MENUS];
+		/* Gyro aiming, on or off; remembered between launches. */
+		_gyroButton = [[TieTouchButton alloc] initWithTitle:@"GYRO"
+													 action:TIE_INPUT_ACTION_NONE
+													   kind:TIE_IOS_BUTTON_TOGGLE
+													  place:TIE_IOS_PLACE_FLIGHT];
+		__weak TieTouchButton* weak_gyro = _gyroButton;
+		_gyroButton.toggle = ^{
+			TieIos_SetGyro(!ios_gyro_on);
+			[weak_gyro setOpen:ios_gyro_on];
+		};
+		TieIos_SetGyro([[NSUserDefaults standardUserDefaults] boolForKey:TieIosGyroKey]);
+		[_gyroButton setOpen:ios_gyro_on];
 		/* Left bar, one column down the outer edge; the throttle beside it. */
-		_leftButtons = @[ escape, keyboard, _groups[0].toggle, _groups[1].toggle ];
-		/* Right bar, two to a row from the top, with FIRE below them. */
+		_leftButtons = @[ escape, keyboard, _groups[0].toggle, _groups[1].toggle, _gyroButton ];
+		/* Right bar, two to a row from the top, with FIRE below them. TGT
+		 * takes the next target on a tap; held, its wheel picks the rest. */
+		static const TieInputAction target_actions[] = {
+			TIE_INPUT_ACTION_TARGET_NEAREST_FIGHTER_OR_MINE,
+			TIE_INPUT_ACTION_TARGET_MY_ATTACKER,
+			TIE_INPUT_ACTION_TARGET_ATTACKER_CHAIN,
+			TIE_INPUT_ACTION_TARGET_NEWEST_CRAFT,
+			/* The target viewer ('z'): the target from outside, with its
+			 * name and weapons; again for the cockpit. */
+			TIE_INPUT_ACTION_TOGGLE_THREAT_DISPLAY,
+			TIE_INPUT_ACTION_TARGET_COMPONENT_NEXT,
+			TIE_INPUT_ACTION_TARGET_COMPONENT_PREV,
+			TIE_INPUT_ACTION_TARGET_CLEAR,
+			TIE_INPUT_ACTION_TARGET_PREV,
+		};
 		_rightButtons = @[
 			TieIos_RepeatButton(@"THR+", TIE_INPUT_ACTION_THROTTLE_UP),
 			TieIos_RepeatButton(@"THR−", TIE_INPUT_ACTION_THROTTLE_DOWN),
 			TieIos_Button(@"WPN", TIE_INPUT_ACTION_CYCLE_WEAPON_GROUP),
 			TieIos_Button(@"LINK", TIE_INPUT_ACTION_CYCLE_WEAPON_FIRING_MODE),
-			TieIos_Button(@"NEAR", TIE_INPUT_ACTION_TARGET_NEAREST_FIGHTER_OR_MINE),
-			TieIos_Button(@"ATKR", TIE_INPUT_ACTION_TARGET_MY_ATTACKER),
-			TieIos_Button(@"TGT◀", TIE_INPUT_ACTION_TARGET_PREV),
-			TieIos_Button(@"TGT▶", TIE_INPUT_ACTION_TARGET_NEXT),
 			TieIos_Button(@"MATCH", TIE_INPUT_ACTION_MATCH_SPEED),
 			TieIos_Button(@"ROLL", TIE_INPUT_ACTION_TARGET_ROLL_THROTTLE_MODIFIER),
+			[self wheelButton:@"TGT"
+						  tap:TIE_INPUT_ACTION_TARGET_NEXT
+					   titles:@[ @"NEAR", @"ATKR", @"CHAIN", @"NEWEST", @"VIEW", @"COMP ▶", @"COMP ◀", @"CLEAR", @"PREV" ]
+					  actions:target_actions],
 		];
-		/* The top row, between the scopes: PAUSE, OK and the target viewer,
-		 * with the rest in submenus that open below it, one at a time. */
+		/* The look views, each placed in the direction it looks: clockwise
+		 * from straight up. */
+		static const TieInputAction look_actions[] = {
+			TIE_INPUT_ACTION_VIEW_STRAIGHT_UP,  TIE_INPUT_ACTION_VIEW_RIGHT_FORWARD, TIE_INPUT_ACTION_VIEW_RIGHT_WING,
+			TIE_INPUT_ACTION_VIEW_RIGHT_SHOULDER, TIE_INPUT_ACTION_VIEW_REAR,        TIE_INPUT_ACTION_VIEW_LEFT_SHOULDER,
+			TIE_INPUT_ACTION_VIEW_LEFT_WING,    TIE_INPUT_ACTION_VIEW_LEFT_FORWARD,
+		};
+		/* The top row, between the scopes: PAUSE and OK, submenus that open
+		 * below it one at a time, and the mission and checkpoint wheels. */
 		NSArray<TieTouchGroup*>* submenus = @[
 			[self groupWithTitle:@"INFO ▾"
 							 key:nil
@@ -637,6 +1105,12 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 							 TieIos_Button(@"EXT CAM", TIE_INPUT_ACTION_VIEW_TOGGLE_EXTERNAL_CAMERA),
 							 TieIos_Button(@"CAM CTRL", TIE_INPUT_ACTION_VIEW_TOGGLE_EXTERNAL_CAMERA_CONTROL),
 							 TieIos_Button(@"MSL CAM", TIE_INPUT_ACTION_CYCLE_WARHEAD_VIEW),
+							 /* Forward on a tap; held, the views all around. */
+							 [self wheelButton:@"LOOK"
+										   tap:TIE_INPUT_ACTION_VIEW_FORWARD
+										titles:@[ @"UP", @"R FWD", @"RIGHT", @"R SHLDR", @"REAR", @"L SHLDR", @"LEFT",
+												  @"L FWD" ]
+									   actions:look_actions],
 						 ]],
 			[self groupWithTitle:@"CMD ▾"
 							 key:nil
@@ -652,15 +1126,47 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 			group.submenu = YES;
 		_groups = [_groups arrayByAddingObjectsFromArray:submenus];
 		_pauseButton = TieIos_Button(@"PAUSE", TIE_INPUT_ACTION_PAUSE);
+		/* Time compression on a tap; held, the rest of the mission, with
+		 * ejecting and ending it only after resting on them. */
+		static const TieInputAction mission_actions[] = {
+			TIE_INPUT_ACTION_CYCLE_TIME_ACCELERATION, TIE_INPUT_ACTION_HYPERSPACE,
+			TIE_INPUT_ACTION_RECORDER_TOGGLE,         TIE_INPUT_ACTION_EJECT,
+			TIE_INPUT_ACTION_END_MISSION,
+		};
+		TieTouchButton* mission = [self wheelButton:@"MISSION"
+												tap:TIE_INPUT_ACTION_CYCLE_TIME_ACCELERATION
+											 titles:@[ @"TIME ×", @"HYPER", @"REC", @"EJECT", @"END" ]
+											actions:mission_actions];
+		mission.dangerousChoices = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(3, 2)];
+		/* Checkpoints: a tap saves to the slot used last; held, saving to
+		 * slots 1-3 across the top, loading them below in the same columns.
+		 * Loading only after resting on it; an empty slot is dimmed. */
+		static const TieInputAction checkpoint_actions[] = {
+			(TieInputAction)(TIE_IOS_CHOICE_SAVE + 1), (TieInputAction)(TIE_IOS_CHOICE_SAVE + 2),
+			(TieInputAction)(TIE_IOS_CHOICE_LOAD + 2), (TieInputAction)(TIE_IOS_CHOICE_LOAD + 1),
+			(TieInputAction)(TIE_IOS_CHOICE_LOAD + 0), (TieInputAction)(TIE_IOS_CHOICE_SAVE + 0),
+		};
+		TieTouchButton* checkpoint = [self wheelButton:@"CHKPT"
+												   tap:(TieInputAction)TIE_IOS_CHOICE_SAVE_LAST
+												titles:@[ @"SAVE 2", @"SAVE 3", @"LOAD 3", @"LOAD 2", @"LOAD 1", @"SAVE 1" ]
+											   actions:checkpoint_actions];
+		checkpoint.dangerousChoices = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(2, 3)];
+		checkpoint.disabledChoices = ^NSIndexSet* {
+			NSMutableIndexSet* empty = [NSMutableIndexSet indexSet];
+			/* Wheel positions 4, 3 and 2 load slots 1, 2 and 3. */
+			for (int slot = 1; slot <= TIE_QUICKSAVE_SLOTS; ++slot)
+				if (!TieQuickSave_HasCheckpoint(slot))
+					[empty addIndex:5 - slot];
+			return empty;
+		};
 		_topButtons = @[
 			_pauseButton,
 			TieIos_Button(@"OK", TIE_INPUT_ACTION_CONFIRM),
-			/* The target viewer ('z'): the target from outside, with its name
-			 * and weapons; again for the cockpit. */
-			TieIos_Button(@"TGT VIEW", TIE_INPUT_ACTION_TOGGLE_THREAT_DISPLAY),
 			submenus[0].toggle,
 			submenus[1].toggle,
 			submenus[2].toggle,
+			mission,
+			checkpoint,
 		];
 		_fireButton = TieIos_Button(@"FIRE", TIE_INPUT_ACTION_FIRE_WEAPON);
 		NSMutableArray<TieTouchButton*>* all = [NSMutableArray array];
@@ -678,6 +1184,18 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 		_buttons = all;
 		_throttle = [[TieThrottleSlider alloc] initWithFrame:CGRectZero];
 		[self addSubview:_throttle];
+		[self addSubview:_wheel];
+		_toast = [[UILabel alloc] initWithFrame:CGRectZero];
+		_toast.textAlignment = NSTextAlignmentCenter;
+		_toast.font = [UIFont boldSystemFontOfSize:15.0];
+		_toast.textColor = UIColor.whiteColor;
+		_toast.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
+		_toast.layer.cornerRadius = 14.0;
+		_toast.clipsToBounds = YES;
+		_toast.alpha = 0.0;
+		_toast.userInteractionEnabled = NO;
+		[self addSubview:_toast];
+
 
 		_stickBase = [CAShapeLayer layer];
 		_stickBase.fillColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
@@ -715,11 +1233,14 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 	return CGRectMake((size.width - width) / 2, 0.0, width, size.height);
 }
 
-/* Two columns from the top. */
+/* Two columns from the top; an odd last button spans both. */
 static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGFloat y, CGFloat cell,
 							   CGFloat gap) {
-	for (NSUInteger index = 0; index < buttons.count; ++index)
-		buttons[index].frame = CGRectMake(x + (index % 2) * (cell + gap), y + (index / 2) * (cell + gap), cell, cell);
+	for (NSUInteger index = 0; index < buttons.count; ++index) {
+		const bool span = index + 1 == buttons.count && index % 2 == 0;
+		buttons[index].frame = CGRectMake(x + (index % 2) * (cell + gap), y + (index / 2) * (cell + gap),
+										  span ? cell * 2 + gap : cell, cell);
+	}
 }
 
 - (void)layoutSubviews {
@@ -773,7 +1294,7 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 	 * as a row below its toggle. */
 	const NSUInteger row_count = self.topButtons.count;
 	const CGFloat row_height = MAX(28.0, MIN(36.0, area.size.height * 0.08));
-	const CGFloat row_width = MIN(80.0, (game.size.width * 0.62 - gap * (row_count - 1)) / row_count);
+	const CGFloat row_width = MIN(80.0, (game.size.width * 0.7 - gap * (row_count - 1)) / row_count);
 	const CGFloat row_x = CGRectGetMidX(game) - (row_width * row_count + gap * (row_count - 1)) / 2;
 	for (NSUInteger index = 0; index < row_count; ++index)
 		self.topButtons[index].frame =
@@ -790,6 +1311,24 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 			group.buttons[index].frame =
 				CGRectMake(gap + index * (row_width + gap), gap, row_width, row_height);
 	}
+}
+
+- (void)showToast:(NSString*)text {
+	self.toast.text = text;
+	const CGSize fit = [self.toast sizeThatFits:CGSizeMake(self.bounds.size.width, 28.0)];
+	const CGRect game = [self gameRect];
+	self.toast.frame = CGRectMake(CGRectGetMidX(game) - (fit.width + 32.0) / 2,
+								  self.safeAreaInsets.top + 52.0, fit.width + 32.0, 28.0);
+	[self bringSubviewToFront:self.toast];
+	[self.toast.layer removeAllAnimations];
+	self.toast.alpha = 1.0;
+	[UIView animateWithDuration:0.4
+						  delay:1.6
+						options:UIViewAnimationOptionBeginFromCurrentState
+					 animations:^{
+						 self.toast.alpha = 0.0;
+					 }
+					 completion:nil];
 }
 
 - (void)updateVisibility {
@@ -931,6 +1470,42 @@ static SDL_Window* TieIos_Window(void) {
 	return window;
 }
 
+/* A checkpoint's outcome: a notice and a buzz. */
+static void TieIos_ReportQuickSave(void) {
+	static uint32_t reported;
+	uint32_t serial;
+	int slot;
+	const TieQuickSaveResult result = TieQuickSave_LastResult(&serial, &slot);
+	if (serial == reported)
+		return;
+	reported = serial;
+	NSString* text = nil;
+	bool ok = false;
+	switch (result) {
+		case TIE_QUICKSAVE_SAVED:
+			text = [NSString stringWithFormat:@"Saved to slot %d", slot];
+			ok = true;
+			break;
+		case TIE_QUICKSAVE_LOADED:
+			text = [NSString stringWithFormat:@"Loaded slot %d", slot];
+			ok = true;
+			break;
+		case TIE_QUICKSAVE_NO_CHECKPOINT:
+			text = [NSString stringWithFormat:@"Slot %d has no checkpoint for this mission", slot];
+			break;
+		case TIE_QUICKSAVE_UNAVAILABLE:
+			text = @"Can't use checkpoints right now";
+			break;
+		case TIE_QUICKSAVE_FAILED:
+		case TIE_QUICKSAVE_NONE:
+			text = @"The checkpoint failed";
+			break;
+	}
+	TieIos_PrepareHaptics();
+	[ios_haptic_notify notificationOccurred:ok ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError];
+	[ios_overlay showToast:text];
+}
+
 void TieIos_Init(void) {
 	SDL_Window* window = TieIos_Window();
 	if (!window) {
@@ -974,6 +1549,9 @@ void TieIos_Frame(void) {
 		[ios_overlay setGameX:(CGFloat)presentation->modern.x / presentation->frame.width
 						width:(CGFloat)presentation->modern.width / presentation->frame.width];
 	[ios_overlay tickButtons];
+	TieIos_ReportQuickSave();
+	TieIos_UpdateGyro(flight, ios_overlay.window.windowScene.interfaceOrientation);
+	TieIos_ApplyStick();
 	TieIos_MapTouchThrottle();
 	uint16_t throttle;
 	if (flight && TieUserTiming_PlayerThrottle(&throttle))
@@ -983,6 +1561,7 @@ void TieIos_Frame(void) {
 
 void TieIos_Shutdown(void) {
 	SDL_RemoveEventWatch(TieIos_WatchEvent, NULL);
+	[ios_motion stopDeviceMotionUpdates];
 	[ios_overlay removeFromSuperview];
 	ios_overlay = nil;
 	TieIos_DetachGamepad();
