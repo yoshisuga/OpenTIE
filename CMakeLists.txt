@@ -13,6 +13,15 @@ set(CMAKE_CXX_STANDARD 17)
 
 include(cmake/CompilerCache.cmake)
 
+# Nintendo 3DS: TIE95 software rendering only, without Aeron's GPU renderer,
+# shaders, remaster or the desktop application. See src/tie_3ds.
+option(TIE_PLATFORM_3DS "Build the Nintendo 3DS port" ${NINTENDO_3DS})
+if(TIE_PLATFORM_3DS)
+    set(ENABLE_FLUIDSYNTH OFF CACHE BOOL "" FORCE)
+    set(ENABLE_NUKED_SC55 OFF CACHE BOOL "" FORCE)
+    set(TIE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -55,9 +64,11 @@ if(NOT MSVC)
     target_link_libraries(tie_libm INTERFACE m)
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+if(NOT TIE_PLATFORM_3DS)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+    pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+endif()
 
 # Top-level aliases for libimuse backend options.
 option(ENABLE_FLUIDSYNTH "Enable FluidSynth MIDI backend" ON)
@@ -429,6 +440,8 @@ set(TIE_RUNTIME_SOURCES
     src/tie_runtime/display/classic_display.h
     src/tie_runtime/display/classic_framebuffer.c
     src/tie_runtime/display/classic_framebuffer.h
+    src/tie_runtime/display/flight_stereo.c
+    src/tie_runtime/display/flight_stereo.h
     src/tie_runtime/runtime/runtime.c
     src/tie_runtime/runtime/runtime.h
     src/tie_runtime/presentation/presentation.c
@@ -564,6 +577,17 @@ tie_enable_warnings(tie_core)
 # Apple SDKs deprecate sprintf, which recovered code retains for matching.
 if(APPLE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
     target_compile_options(tie_core PRIVATE -Wno-deprecated-declarations)
+endif()
+
+if(TIE_PLATFORM_3DS)
+    # newlib's int32_t is long, so int and int32_t pointers differ in type
+    # (not in size) on devkitARM.
+    foreach(target landru imuse tie_core)
+        target_compile_options(${target} PRIVATE -Wno-error=incompatible-pointer-types)
+    endforeach()
+    target_compile_definitions(tie_core PUBLIC TIE_PLATFORM_3DS=1)
+    add_subdirectory(src/tie_3ds)
+    return()
 endif()
 
 # Aeron loads all compiled shaders from one executable-relative directory.

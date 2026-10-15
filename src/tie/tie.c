@@ -84,6 +84,7 @@
 #include "tie_runtime/timing/flight_cadence.h"
 #include "tie_runtime/timing/flight_timing.h"
 #include "tie_runtime/timing/replay_timing.h"
+#include "tie_runtime/display/flight_stereo.h"
 #include "util/binio.h"
 
 #ifndef TIE_MODERN
@@ -2268,6 +2269,10 @@ void tie_updatescreen(void) {
 		}
 	}
 
+#ifdef TIE_PLATFORM_3DS
+	/* PORT: the stereo right-eye pass views from the camera's right. */
+	TieFlightStereo_OffsetCamera();
+#endif
 	/* --- Step 2: full-frame buffer reset ---------------------------- */
 	if (fullupdateflag) {
 		logbuf2_clearbuffer();
@@ -2476,6 +2481,10 @@ void tie_updatescreen(void) {
 #ifdef TIE_MODERN
 	/* Signal that the application must upload the classic framebuffer. */
 	vesa_dirty_gbl = true;
+#endif
+#ifdef TIE_PLATFORM_3DS
+	/* PORT: render the stereo right eye from this frame's state. */
+	TieFlightStereo_AfterRender();
 #endif
 }
 

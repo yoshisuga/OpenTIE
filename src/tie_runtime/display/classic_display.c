@@ -74,7 +74,13 @@ uint16_t TieClassicDisplay_FlightMode(void) {
 	if (profile->version == TIE_GAME_VERSION_TIE98)
 		return profile->tie98_original_renderer == TIE98_ORIGINAL_RENDERER_D3D ? TIE_FLIGHT_RES_SVGA_D3D
 																			   : TIE_FLIGHT_RES_SVGA_16;
+#ifdef TIE_PLATFORM_3DS
+	/* The 640x480 mode cannot be shown legibly on the 400x240 top screen,
+	 * whatever foption.cfg selects. */
+	return TIE_FLIGHT_RES_VGA;
+#else
 	return f_res == 1 ? TIE_FLIGHT_RES_SVGA : TIE_FLIGHT_RES_VGA;
+#endif
 }
 
 bool TieClassicDisplay_ActivateFlight(void) {

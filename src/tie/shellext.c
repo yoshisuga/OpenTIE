@@ -290,7 +290,11 @@ void shellext_Load_Preferences(void) {
 	options_gbl.game_level = 1;
 	options_gbl.auto_backup = 1;
 	options_gbl.auto_restore = 1;
-#ifdef TIE_MODERN
+#ifdef TIE_PLATFORM_3DS
+	/* PORT: The 3DS top screen is 400x240, so new users default to the
+	 * 320x200 flight mode, whose cockpit art is drawn for that size. */
+	f_res = 0;
+#elif defined(TIE_MODERN)
 	/* PORT: Default new users to the TIE95 640x480 flight mode on every
 	 * load; the original keeps the previous value when foption.cfg is
 	 * missing. */
