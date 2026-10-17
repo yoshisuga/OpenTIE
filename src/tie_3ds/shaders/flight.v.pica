@@ -1,0 +1,74 @@
+; Flight geometry: transforms craft-local positions by a per-draw clip matrix
+; (projection x view x craft-to-world, tilted for the 3DS top screen) and
+; lights each face the classic way. The fragment stage samples a lookup
+; texture of the materialcolors ramps through the palette (s = ramp entry,
+; t = material row), as tie_remaster's flight_mesh_classic_lut does:
+;   flat faces:    entry 15 - min(15, floor(lambert * 16)), at the texel
+;                  centre, so the colour is exact;
+;   Gouraud faces: the corner normal and the continuous shade
+;                  clamp((63 - lambert * 64) / 4, 0, 15), interpolated and
+;                  filtered between ramp entries.
+
+.fvec clip[4]
+.fvec light   ; craft-local light direction, w = 0
+.fvec shading ; x = 1 while the game's Gouraud shading is on
+
+.constf constants(0.0, 1.0, 16.0, 15.0)
+.constf ramp(0.0625, 15.5, 15.75, 0.03125)
+.alias zeros constants.xxxx
+.alias ones constants.yyyy
+.alias sixteen constants.zzzz
+.alias fifteen constants.wwww
+
+.out outpos position
+.out outtc0 texcoord0
+
+.alias inpos v0
+.alias innormal v1
+.alias incornernormal v2
+.alias inface v3 ; x = lookup texture t of the material row, y = 1 if Gouraud-eligible
+
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w, ones
+
+	dp4 outpos.x, clip[0], r0
+	dp4 outpos.y, clip[1], r0
+	dp4 outpos.z, clip[2], r0
+	dp4 outpos.w, clip[3], r0
+
+	; Uniforms and constants may only be the first source operand.
+	; r2.x = 1 for a Gouraud face while Gouraud shading is on.
+	mul r2.x, shading.x, inface.y
+	; r3 = the face normal, or the corner normal for Gouraud. An instruction
+	; may read only one input register.
+	mov r6.xyz, innormal
+	add r3.xyz, incornernormal, -r6
+	mad r3.xyz, r3.xyz, r2.xxx, r6
+	; r1.x = lambert in [0, 1].
+	dp3 r1.x, light, r3
+	max r1.x, zeros, r1.x
+	min r1.x, ones, r1.x
+
+	; r4.x = flat s = (15.5 - min(15, floor(16 * lambert))) / 16
+	mul r4.x, sixteen, r1.x
+	flr r4.x, r4.x
+	min r4.x, fifteen, r4.x
+	add r4.x, ramp.y, -r4.x
+	mul r4.x, ramp.x, r4.x
+
+	; r5.x = Gouraud s = (clamp(15.75 - 16 * lambert, 0, 15) + 0.5) / 16
+	mul r5.x, sixteen, r1.x
+	add r5.x, ramp.z, -r5.x
+	max r5.x, zeros, r5.x
+	min r5.x, fifteen, r5.x
+	mul r5.x, ramp.x, r5.x
+	add r5.x, ramp.w, r5.x
+
+	add r5.x, r5.x, -r4.x
+	mad r1.x, r5.x, r2.x, r4.x
+	mov r1.y, inface.x
+	mov r1.zw, zeros
+	mov outtc0, r1
+	end
+.end

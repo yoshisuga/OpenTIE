@@ -4,6 +4,7 @@
 #include "tie_runtime/audio/imuse_api.h"
 #ifdef TIE_MODERN
 #include "tie_runtime/runtime/help_task.h"
+#include "tie_runtime/runtime/options_task.h"
 #include "tie_runtime/runtime/inflight_info_task.h"
 #include "tie_runtime/runtime/wingman_task.h"
 #endif
@@ -1959,7 +1960,11 @@ void user_inputforplane(void) {
 				break;
 			/* In-flight options room. */
 			case KEY_ESCAPE:
-#ifdef TIE_MODERN
+#ifdef TIE_PLATFORM_3DS
+				/* PORT: the 3DS has no OpenTIE settings menu; keep the original
+				 * in-flight options room. */
+				TieFlightRequest_InfoRoom(6);
+#elif defined(TIE_MODERN)
 				if (replayviewmode)
 					TieFlightRequest_InfoRoom(6);
 				else
@@ -3676,12 +3681,14 @@ int32_t user_inflightinfo(int32_t screen_id) {
 		{
 			int panel_idx;
 #ifdef TIE_MODERN
+#ifndef TIE_PLATFORM_3DS
 			if (screen == 6) {
 				TieRuntime_RequestSettingsMenu();
 				continuation->exit_flag = 1;
 				continuation->phase = INFLIGHT_PHASE_FINISH;
 				return 0;
 			}
+#endif
 			TieFlightScreen_SetActive(screen < 0 || screen > 6 ? TIE_FLIGHT_SCREEN_NORMAL
 															   : (TieFlightScreen)(screen + 1));
 #endif
@@ -3756,7 +3763,11 @@ int32_t user_inflightinfo(int32_t screen_id) {
 #endif
 					break;
 				case 6:
-#ifndef TIE_MODERN
+#ifdef TIE_PLATFORM_3DS
+					/* PORT: the original options room, as a task like the help
+					 * room, where desktop builds open the OpenTIE settings. */
+					TieOptions_Begin();
+#elif !defined(TIE_MODERN)
 					sub = (uint16_t)option_optionsroom(0);
 #endif
 					break;

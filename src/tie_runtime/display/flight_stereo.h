@@ -19,6 +19,11 @@ void TieFlightStereo_SetStrength(float strength);
 void TieFlightStereo_OffsetCamera(void);
 void TieFlightStereo_AfterRender(void);
 
+/* Also keep the 3D-only picture of each 320x200 render when not in stereo,
+ * for presenters that replace the 3D view but keep the cockpit and HUD. */
+void TieFlightStereo_SetCaptureScene(bool capture);
+bool TieFlightStereo_TakeScene(const uint8_t** scene);
+
 /* The 3D-only left and right pictures (320x200, pitch 320) of the latest
  * stereo render, if one happened since the last call. The left picture is
  * the framebuffer before the cockpit panel drew over it. */

@@ -1,0 +1,44 @@
+--- a/src/thread/n3ds/SDL_systhread.c
++++ b/src/thread/n3ds/SDL_systhread.c
+@@ -61,14 +61,35 @@
+         }
+     }
+ 
+-    thread->handle = threadCreate(ThreadEntry,
+-                                  thread,
+-                                  stack_size,
+-                                  priority,
+-                                  cpu,
+-                                  false);
++    /* OpenTIE: its game worker threads ("tie-" names, such as the music
++     * synthesizer) run beside the game on the New 3DS's second application
++     * core, or else the system core. */
++    if (thread->name && SDL_strncmp(thread->name, "tie-", 4) == 0) {
++        bool new3ds = false;
++        APT_CheckNew3DS(&new3ds);
++        if (new3ds) {
++            thread->handle = threadCreate(ThreadEntry, thread, stack_size, priority, 2, false);
++            if (thread->handle) {
++                SDL_Log("thread %s on core 2", thread->name);
++            } else if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80))) {
++                thread->handle = threadCreate(ThreadEntry, thread, stack_size, priority, 1, false);
++                if (thread->handle) {
++                    SDL_Log("thread %s on core 1", thread->name);
++                }
++            }
++        }
++    }
+ 
+     if (!thread->handle) {
++        thread->handle = threadCreate(ThreadEntry,
++                                      thread,
++                                      stack_size,
++                                      priority,
++                                      cpu,
++                                      false);
++    }
++
++    if (!thread->handle) {
+         return SDL_SetError("Couldn't create thread");
+     }
+ 

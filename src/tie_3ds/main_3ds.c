@@ -16,7 +16,10 @@
 #include "aeron/vfs.h"
 #include "tie_app/config/app_config.h"
 #include "tie_app/setup/installation.h"
+#include "tie_3ds/flight_gpu_3ds.h"
 #include "tie_3ds/n3ds_input.h"
+#include "tie_3ds/settings_3ds.h"
+#include "tie_3ds/touch_panel_3ds.h"
 #include "tie/drawpol.h"
 #include "tie/logbuf2.h"
 #include "tie/tie.h"
@@ -68,9 +71,15 @@ static void TieN3ds_ReportFrameStats(TieN3dsFrameStats* stats, uint64_t now_us) 
 	if (elapsed_us < 1000000 || stats->frames == 0)
 		return;
 	const double frames = stats->frames;
+	if (TieN3dsTouchPanel_Active()) {
+		TieN3dsTouchPanel_SetStats((float)(frames * 1e6 / (double)elapsed_us),
+								   (float)((double)stats->tick_us / frames / 1000.0));
+		*stats = (TieN3dsFrameStats) { .window_start_us = now_us };
+		return;
+	}
 	consoleSelect(&s_status_console);
-	printf("\x1b[1;1H%5.1f fps  tick %5.1f ms\x1b[K\n", frames * 1e6 / (double)elapsed_us,
-		   (double)stats->tick_us / frames / 1000.0);
+	printf("\x1b[1;1H%5.1f fps  tick %5.1f ms  gpu %u\x1b[K\n", frames * 1e6 / (double)elapsed_us,
+		   (double)stats->tick_us / frames / 1000.0, TieN3dsFlightGpu_DrawnCount());
 	printf("draw %4.1f ms  vsync wait %4.1f ms\x1b[K", (double)stats->draw_us / frames / 1000.0,
 		   (double)stats->vsync_us / frames / 1000.0);
 	consoleSelect(&s_log_console);
@@ -86,7 +95,9 @@ static void TieN3ds_LogOutput(void* userdata, int category, SDL_LogPriority prio
 	(void)userdata;
 	(void)category;
 	(void)priority;
-	printf("%s\n", message);
+	/* The flight control panel covers the bottom-screen console. */
+	if (!TieN3dsTouchPanel_Active())
+		printf("%s\n", message);
 	if (s_log_file) {
 		fprintf(s_log_file, "%s\n", message);
 		fflush(s_log_file);
@@ -161,12 +172,17 @@ static void TieN3ds_HandleKeyboardRequest(const TieSnapshot* snapshot) {
  * (kept at screen depth) and which are space (moved behind the screen by
  * the convergence shift). */
 
+/* Flight's 3D view comes from the citro3d renderer (flight_gpu_3ds) under
+ * the classic cockpit and HUD, instead of the software rasterizer. */
+static const bool k_gpu_flight = false;
+
 enum {
 	TIE_3DS_STEREO_CONVERGENCE = 8,   /* top-screen pixels at full slider */
 	TIE_3DS_XTRANS_DATA_SIZE = 64000, /* smallest buffer xtransdataptr names */
 };
 
 static float s_stereo_strength;
+static bool s_gpu_flight_active;
 static uint8_t s_space_mask[TIE_3DS_CLASSIC_WIDTH * TIE_3DS_CLASSIC_HEIGHT];
 static uint8_t s_right_frame[TIE_3DS_CLASSIC_WIDTH * TIE_3DS_CLASSIC_HEIGHT];
 
@@ -229,8 +245,32 @@ static void TieN3ds_BeginStereoFrame(const TieSnapshot* snapshot) {
 	const bool flying = snapshot && snapshot->scene_kind == TIE_SCENE_FLIGHT &&
 						snapshot->flight_screen == TIE_FLIGHT_SCREEN_NORMAL && !snapshot->replay_mode &&
 						flightResolution == TIE_FLIGHT_RES_VGA;
-	s_stereo_strength = flying ? osGet3DSliderState() : 0.0f;
+	s_gpu_flight_active = flying && k_gpu_flight;
+	s_stereo_strength = flying && !s_gpu_flight_active ? osGet3DSliderState() : 0.0f;
 	TieFlightStereo_SetStrength(s_stereo_strength);
+	TieFlightStereo_SetCaptureScene(s_gpu_flight_active);
+}
+
+/* In GPU flight the classic frame keeps only the cockpit and whatever the
+ * panel drew after the 3D render (instruments, gunsight, brackets); the
+ * rest of the 3D window is left for the GPU scene. */
+static void TieN3ds_UpdateGpuFlight(void) {
+	const uint8_t* scene = NULL;
+	const TieFramebuffer* framebuffer = TieClassicFramebuffer_Current();
+	if (!s_gpu_flight_active || !TieFlightStereo_TakeScene(&scene) || !framebuffer || !framebuffer->pixels ||
+		framebuffer->width != TIE_3DS_CLASSIC_WIDTH || framebuffer->height != TIE_3DS_CLASSIC_HEIGHT ||
+		!TieN3ds_DecodeSpaceMask()) {
+		AeronN3ds_SetComposite(NULL, 0, 0);
+		return;
+	}
+	for (int y = 0; y < TIE_3DS_CLASSIC_HEIGHT; ++y) {
+		const uint8_t* final_row = framebuffer->pixels + y * framebuffer->pitch;
+		const uint8_t* scene_row = scene + y * TIE_FLIGHT_STEREO_WIDTH;
+		uint8_t* mask = s_space_mask + y * TIE_3DS_CLASSIC_WIDTH;
+		for (int x = 0; x < TIE_3DS_CLASSIC_WIDTH; ++x)
+			mask[x] = mask[x] && final_row[x] == scene_row[x];
+	}
+	AeronN3ds_SetComposite(s_space_mask, TIE_3DS_CLASSIC_WIDTH, TIE_3DS_CLASSIC_HEIGHT);
 }
 
 /* The right eye takes its 3D from the right-eye render and, wherever the
@@ -256,6 +296,27 @@ static void TieN3ds_UpdateStereo(void) {
 	}
 	AeronN3ds_SetStereo(s_space_mask, s_right_frame, TIE_3DS_CLASSIC_WIDTH, TIE_3DS_CLASSIC_HEIGHT,
 						(int)(s_stereo_strength * TIE_3DS_STEREO_CONVERGENCE + 0.5f));
+}
+
+/* During ordinary cockpit flight the bottom screen is the control panel;
+ * elsewhere it is the console and the touchscreen is the mouse. */
+static void TieN3ds_UpdateTouchPanel(const TieSnapshot* snapshot) {
+	const bool active = snapshot && snapshot->scene_kind == TIE_SCENE_FLIGHT &&
+						snapshot->flight_screen == TIE_FLIGHT_SCREEN_NORMAL && snapshot->replay_mode != 2;
+	if (active != TieN3dsTouchPanel_Active()) {
+		TieN3dsTouchPanel_SetActive(active);
+		AeronN3ds_SetBottomScreen(active ? TieN3dsTouchPanel_Draw : NULL);
+		if (!active) {
+			/* Repaint the console the panel drew over. */
+			consoleSelect(&s_status_console);
+			consoleClear();
+			consoleSelect(&s_log_console);
+			consoleClear();
+		}
+	}
+	TieN3dsTouchPanel_Update();
+	/* Gyro aiming only while flying from the cockpit. */
+	AeronN3ds_SetGyroAiming(active && TieN3dsSettings_Get(TIE_3DS_SETTING_GYRO));
 }
 
 /* Binds newly connected gamepads, as tie_app/frame_loop.c does each frame;
@@ -303,6 +364,7 @@ static void TieN3ds_RunFrames(void) {
 		TieClassicLayer_SyncInputExtent();
 		TieInput_UpdateKeyboard(input, false);
 		TieInput_BeginFrame(delta_us);
+		TieN3ds_UpdateTouchPanel(TieSnapshot_Current());
 		TieN3ds_BeginStereoFrame(TieSnapshot_Current());
 		const uint64_t tick_start_us = Aeron_NowUs();
 		TieRuntime_Tick(delta_us);
@@ -317,6 +379,7 @@ static void TieN3ds_RunFrames(void) {
 		const uint64_t draw_start_us = Aeron_NowUs();
 		TieClassicLayer_SyncInputExtent();
 		TieN3ds_UpdateStereo();
+		TieN3ds_UpdateGpuFlight();
 		if (TieClassicDisplay_OutputKind() == TIE_CLASSIC_OUTPUT_INDEXED_FRAMEBUFFER)
 			TieClassicLayer_Submit(TieClassicFramebuffer_Current());
 		TieN3ds_DrawFrontendCursor(TieSnapshot_Current());
@@ -445,6 +508,8 @@ int main(void) {
 	if (!flight_source || !TiePresentation_Init(flight_source->presentation_aspect))
 		return TieN3ds_Fail("Presentation Error", "Could not initialize the classic presentation.");
 
+	if (k_gpu_flight)
+		AeronN3ds_SetEyeOverlay(TieN3dsFlightGpu_DrawEye);
 	Aeron_LogInfo("tie.3ds", "game started");
 	TieN3ds_RunFrames();
 	const bool failed = Aeron_FatalErrorRequested();
@@ -455,6 +520,11 @@ int main(void) {
 	if (!TieAppConfig_Save(vfs, app_config_state, error, error_capacity))
 		Aeron_LogError("tie.config", "%s", error);
 	TieAppConfig_Destroy(app_config_state);
+	AeronN3ds_SetEyeOverlay(NULL);
+	AeronN3ds_SetBottomScreen(NULL);
+	AeronN3ds_SetGyroAiming(false);
+	TieN3dsTouchPanel_Shutdown();
+	TieN3dsFlightGpu_Shutdown();
 	if (failed)
 		return TieN3ds_Fail("OpenTIE stopped", "A fatal error was reported; see the log above.");
 	Aeron_Shutdown();

@@ -24,20 +24,40 @@
 #include <citro3d.h>
 #include <string.h>
 
-enum { TIE_3DS_TOP_WIDTH = 400, TIE_3DS_TOP_HEIGHT = 240 };
+enum { TIE_3DS_TOP_WIDTH = 400, TIE_3DS_TOP_HEIGHT = 240, TIE_3DS_BOTTOM_WIDTH = 320 };
 
 /* The classic picture is scaled to 4:3 at the top screen's full height. */
 enum { TIE_3DS_PICTURE_WIDTH = 320, TIE_3DS_PICTURE_X = (TIE_3DS_TOP_WIDTH - TIE_3DS_PICTURE_WIDTH) / 2 };
 
 /* ---- Touchscreen pointer --------------------------------------------- */
 
-enum { TIE_3DS_TOUCH_WIDTH = 320, TIE_3DS_TOUCH_HEIGHT = 240 };
-
 static AeronRectI s_touch_target;
-static bool s_touch_down;
-static bool s_click_pending;
-static bool s_release_pending;
-static uint32_t s_click_button;
+static void (*s_bottom_screen)(void);
+
+void AeronN3ds_SetBottomScreen(void (*draw)(void)) { s_bottom_screen = draw; }
+
+/* The bottom screen is a trackpad over the classic picture: dragging moves
+ * the pointer by the finger's motion, a quick tap clicks where the pointer
+ * is (L held makes it a right click), and touching still for a moment
+ * presses the button so a following drag carries it. */
+enum {
+	TIE_3DS_TOUCH_WIDTH = 320,
+	TIE_3DS_TOUCH_HEIGHT = 240,
+	TIE_3DS_TOUCH_DRAG_THRESHOLD = 4, /* touch pixels before a touch is a drag */
+	TIE_3DS_TOUCH_TAP_MS = 250,       /* longest touch that still clicks */
+	TIE_3DS_TOUCH_HOLD_MS = 400,      /* still touch that presses for a drag */
+};
+
+static struct {
+	float x, y; /* pointer, in touch-screen units over the picture */
+	bool down;
+	bool dragging;
+	bool button_held; /* pressed by a still hold */
+	bool release_pending;
+	uint32_t button;
+	int start_x, start_y, last_x, last_y;
+	u64 start_ms;
+} s_touch = { .x = TIE_3DS_TOUCH_WIDTH / 2.0f, .y = TIE_3DS_TOUCH_HEIGHT / 2.0f };
 
 void AeronN3ds_SetTouchTarget(const AeronRectI* rect) {
 	if (rect)
@@ -54,43 +74,156 @@ static void TieN3ds_ReleaseButton(AeronMouseSnapshot* mouse, uint32_t button) {
 	mouse->released_buttons |= button;
 }
 
-/* The bottom screen is an absolute pointer over the classic picture. A touch
- * moves the pointer first and presses on the following frame, so the game
- * sees the pointer arrive before the click; L held at touch-down makes it a
- * right click. SDL's event pump has already scanned the HID state. */
+static float TieN3ds_Clamp(float value, float low, float high) { return value < low ? low : value > high ? high : value; }
+
 static void TieN3ds_UpdateTouchPointer(AeronMouseSnapshot* mouse) {
-	const u32 held = hidKeysHeld();
+	/* The bottom-screen control panel owns the touchscreen. */
+	const u32 held = s_bottom_screen ? 0u : hidKeysHeld();
+	const u64 now_ms = osGetTime();
+	if (s_touch.release_pending) {
+		TieN3ds_ReleaseButton(mouse, s_touch.button);
+		s_touch.release_pending = false;
+	}
 	if (held & KEY_TOUCH) {
 		touchPosition touch;
 		hidTouchRead(&touch);
-		mouse->raw_x = touch.px;
-		mouse->raw_y = touch.py;
-		if (s_touch_target.width > 0 && s_touch_target.height > 0) {
-			mouse->x = s_touch_target.x + touch.px * s_touch_target.width / TIE_3DS_TOUCH_WIDTH;
-			mouse->y = s_touch_target.y + touch.py * s_touch_target.height / TIE_3DS_TOUCH_HEIGHT;
-			mouse->inside_content = 1;
-		}
-		if (!s_touch_down) {
-			s_touch_down = true;
-			s_click_button = (held & KEY_L) ? AERON_MOUSE_BUTTON_RIGHT : AERON_MOUSE_BUTTON_LEFT;
-			s_click_pending = true;
-		} else if (s_click_pending) {
-			TieN3ds_PressButton(mouse, s_click_button);
-			s_click_pending = false;
-		}
-	} else if (s_touch_down) {
-		s_touch_down = false;
-		if (s_click_pending) {
-			/* A one-frame tap: press now and release next frame. */
-			TieN3ds_PressButton(mouse, s_click_button);
-			s_click_pending = false;
-			s_release_pending = true;
+		if (!s_touch.down) {
+			s_touch.down = true;
+			s_touch.dragging = false;
+			s_touch.button_held = false;
+			s_touch.button = (held & KEY_L) ? AERON_MOUSE_BUTTON_RIGHT : AERON_MOUSE_BUTTON_LEFT;
+			s_touch.start_x = s_touch.last_x = touch.px;
+			s_touch.start_y = s_touch.last_y = touch.py;
+			s_touch.start_ms = now_ms;
 		} else {
-			TieN3ds_ReleaseButton(mouse, s_click_button);
+			const int moved_x = touch.px - s_touch.start_x;
+			const int moved_y = touch.py - s_touch.start_y;
+			if (!s_touch.dragging && moved_x * moved_x + moved_y * moved_y >=
+										 TIE_3DS_TOUCH_DRAG_THRESHOLD * TIE_3DS_TOUCH_DRAG_THRESHOLD)
+				s_touch.dragging = true;
+			if (s_touch.dragging) {
+				s_touch.x = TieN3ds_Clamp(s_touch.x + (float)(touch.px - s_touch.last_x), 0.0f,
+										  TIE_3DS_TOUCH_WIDTH - 1.0f);
+				s_touch.y = TieN3ds_Clamp(s_touch.y + (float)(touch.py - s_touch.last_y), 0.0f,
+										  TIE_3DS_TOUCH_HEIGHT - 1.0f);
+			} else if (!s_touch.button_held && now_ms - s_touch.start_ms >= TIE_3DS_TOUCH_HOLD_MS) {
+				s_touch.button_held = true;
+				TieN3ds_PressButton(mouse, s_touch.button);
+			}
+			s_touch.last_x = touch.px;
+			s_touch.last_y = touch.py;
 		}
-	} else if (s_release_pending) {
-		TieN3ds_ReleaseButton(mouse, s_click_button);
-		s_release_pending = false;
+	} else if (s_touch.down) {
+		s_touch.down = false;
+		if (s_touch.button_held) {
+			TieN3ds_ReleaseButton(mouse, s_touch.button);
+		} else if (!s_touch.dragging && now_ms - s_touch.start_ms <= TIE_3DS_TOUCH_TAP_MS) {
+			/* A tap: press now and release next frame. */
+			TieN3ds_PressButton(mouse, s_touch.button);
+			s_touch.release_pending = true;
+		}
+	}
+
+	mouse->raw_x = (int)s_touch.x;
+	mouse->raw_y = (int)s_touch.y;
+	if (s_touch_target.width > 0 && s_touch_target.height > 0) {
+		mouse->x = s_touch_target.x + (int)s_touch.x * s_touch_target.width / TIE_3DS_TOUCH_WIDTH;
+		mouse->y = s_touch_target.y + (int)s_touch.y * s_touch_target.height / TIE_3DS_TOUCH_HEIGHT;
+		mouse->inside_content = 1;
+	}
+}
+
+/* ---- Gyro aiming (after tie_app/ios/ios_app.m) ------------------------ */
+
+#define TIE_3DS_GYRO_FULL_DPS 86.0f    /* rotation rate for a full deflection (1.5 rad/s) */
+#define TIE_3DS_GYRO_DEADZONE_DPS 2.0f /* hand tremor ignored */
+#define TIE_3DS_GYRO_BIAS_FRAMES 30    /* frames averaged for the resting offset */
+#define TIE_3DS_GYRO_BIAS_ADAPT 0.01f  /* how quickly the offset follows a resting drift */
+
+static bool s_gyro_active;
+static float s_gyro_raw_per_dps; /* sensor sensitivity: raw units per degree/s */
+static float s_gyro_bias[3];     /* raw reading at rest */
+static int s_gyro_bias_frames;
+
+void AeronN3ds_SetGyroAiming(bool active) {
+	if (active == s_gyro_active)
+		return;
+	if (active) {
+		if (R_FAILED(HIDUSER_EnableGyroscope()) || R_FAILED(HIDUSER_GetGyroscopeRawToDpsCoefficient(&s_gyro_raw_per_dps)) ||
+			!(s_gyro_raw_per_dps > 0.0f)) {
+			Aeron_LogWarn("aeron.input", "gyroscope unavailable");
+			return;
+		}
+		Aeron_LogInfo("aeron.input", "gyroscope on: %.3f raw per degree/s", (double)s_gyro_raw_per_dps);
+		memset(s_gyro_bias, 0, sizeof s_gyro_bias);
+		s_gyro_bias_frames = 0;
+	} else {
+		HIDUSER_DisableGyroscope();
+	}
+	s_gyro_active = active;
+}
+
+static float TieN3ds_GyroAxis(float dps) {
+	const float magnitude = dps < 0.0f ? -dps : dps;
+	if (magnitude < TIE_3DS_GYRO_DEADZONE_DPS)
+		return 0.0f;
+	const float sign = dps < 0.0f ? -1.0f : 1.0f;
+	return sign * (magnitude - TIE_3DS_GYRO_DEADZONE_DPS) / TIE_3DS_GYRO_FULL_DPS;
+}
+
+/* Rotation rates in degrees/s with the sensor's resting offset removed: the
+ * offset is averaged over the first frames, then follows slow drift while
+ * the console is nearly still. Returns false while still averaging. */
+static bool TieN3ds_GyroRates(float dps[3]) {
+	angularRate rate;
+	hidGyroRead(&rate);
+	const float raw[3] = { (float)rate.x, (float)rate.y, (float)rate.z };
+	if (s_gyro_bias_frames < TIE_3DS_GYRO_BIAS_FRAMES) {
+		++s_gyro_bias_frames;
+		for (int axis = 0; axis < 3; ++axis)
+			s_gyro_bias[axis] += (raw[axis] - s_gyro_bias[axis]) / (float)s_gyro_bias_frames;
+		return false;
+	}
+	for (int axis = 0; axis < 3; ++axis) {
+		dps[axis] = (raw[axis] - s_gyro_bias[axis]) / s_gyro_raw_per_dps;
+		if (dps[axis] > -TIE_3DS_GYRO_DEADZONE_DPS && dps[axis] < TIE_3DS_GYRO_DEADZONE_DPS)
+			s_gyro_bias[axis] += (raw[axis] - s_gyro_bias[axis]) * TIE_3DS_GYRO_BIAS_ADAPT;
+	}
+	return true;
+}
+
+static int16_t TieN3ds_AddToAxis(int16_t axis, float deflection) {
+	float value = (float)axis + deflection * 32767.0f;
+	if (value > 32767.0f)
+		value = 32767.0f;
+	if (value < -32768.0f)
+		value = -32768.0f;
+	return (int16_t)value;
+}
+
+/* Gyro x is rotation about the console's horizontal axis (pitch) and y
+ * about its vertical axis (yaw). Both are added to the left stick before the
+ * controller mapping, so the stick's inversion settings apply to the gyro. */
+static void TieN3ds_ApplyGyro(AeronInputSnapshot* input) {
+	if (!s_gyro_active)
+		return;
+	float dps[3];
+	if (!TieN3ds_GyroRates(dps))
+		return;
+	/* Tilting the top of the console away acts as pushing the Circle Pad
+	 * forward (negative gamepad y), so the stick's pitch inversion applies to
+	 * both alike. */
+	const float yaw = TieN3ds_GyroAxis(-dps[1]);
+	const float pitch = TieN3ds_GyroAxis(-dps[0]);
+	for (int i = 0; i < AERON_CONTROLLER_MAX; ++i) {
+		AeronControllerSnapshot* controller = &input->controllers[i];
+		if (!controller->connected || controller->kind != AERON_CONTROLLER_KIND_GAMEPAD)
+			continue;
+		controller->gamepad_axes[AERON_GAMEPAD_AXIS_LEFTX] =
+			TieN3ds_AddToAxis(controller->gamepad_axes[AERON_GAMEPAD_AXIS_LEFTX], yaw);
+		controller->gamepad_axes[AERON_GAMEPAD_AXIS_LEFTY] =
+			TieN3ds_AddToAxis(controller->gamepad_axes[AERON_GAMEPAD_AXIS_LEFTY], pitch);
+		break;
 	}
 }
 
@@ -139,6 +272,7 @@ int32_t Aeron_BeginFrame(void) {
 	Aeron_BeginInputFrame(&g_aeron.input);
 	Aeron_PumpEvents();
 	Aeron_UpdateControllers(&g_aeron.input);
+	TieN3ds_ApplyGyro(&g_aeron.input);
 	TieN3ds_UpdateTouchPointer(&g_aeron.input.mouse);
 	TieN3ds_DeliverQueuedText(&g_aeron.input);
 	g_aeron.input.window_width = TIE_3DS_TOP_WIDTH;
@@ -175,6 +309,7 @@ typedef struct TieN3dsPresenter {
 	bool failed;
 	C3D_RenderTarget* left;
 	C3D_RenderTarget* right;
+	C3D_RenderTarget* bottom;
 	C3D_Tex textures[TIE_3DS_TEXTURE_SETS][2]; /* [set][eye] */
 	int current;                               /* set holding the frame to present */
 	Tex3DS_SubTexture subtexture;
@@ -187,17 +322,30 @@ typedef struct TieN3dsPresenter {
 	int frame_width;
 	int frame_height;
 	bool frame_ready;
-	bool frame_stereo; /* this frame has a right-eye picture and a cockpit mask */
+	bool frame_stereo;    /* this frame has a right-eye picture and a cockpit mask */
+	bool frame_composite; /* this frame's alpha leaves space to the eye overlay */
 	bool output_3d;
 } TieN3dsPresenter;
 
 static TieN3dsPresenter s_presenter;
+static void (*s_eye_overlay)(int eye);
+
+void AeronN3ds_SetEyeOverlay(void (*draw)(int eye)) { s_eye_overlay = draw; }
 
 static const uint8_t* s_stereo_mask;
 static const uint8_t* s_stereo_right;
 static int s_stereo_width;
 static int s_stereo_height;
 static int s_stereo_convergence;
+static const uint8_t* s_composite_mask;
+static int s_composite_width;
+static int s_composite_height;
+
+void AeronN3ds_SetComposite(const uint8_t* space_mask, int width, int height) {
+	s_composite_mask = space_mask;
+	s_composite_width = width;
+	s_composite_height = height;
+}
 
 void AeronN3ds_SetStereo(const uint8_t* space_mask, const uint8_t* right_frame, int width, int height,
 						 int convergence) {
@@ -213,12 +361,13 @@ void AeronN3ds_SetStereo(const uint8_t* space_mask, const uint8_t* right_frame, 
 static uint32_t TieN3ds_MortonX(uint32_t x) { return (x & 1u) | ((x & 2u) << 1) | ((x & 4u) << 2); }
 static uint32_t TieN3ds_MortonY(uint32_t y) { return ((y & 1u) << 1) | ((y & 2u) << 2) | ((y & 4u) << 3); }
 
-/* A top-screen render target whose output transfer writes the screen's
- * actual pixel format: SDL's video init leaves the top screen in RGBA8,
- * while C2D_CreateScreenTarget assumes libctru's default BGR8. */
-static C3D_RenderTarget* TieN3ds_CreateTopTarget(gfx3dSide_t side) {
+/* A screen render target whose output transfer writes the screen's actual
+ * pixel format: SDL's video init leaves the top screen in RGBA8 and the
+ * console the bottom in RGB565, while C2D_CreateScreenTarget assumes
+ * libctru's default BGR8. */
+static C3D_RenderTarget* TieN3ds_CreateScreenTarget(gfxScreen_t screen, gfx3dSide_t side, int width) {
 	GX_TRANSFER_FORMAT output;
-	switch (gfxGetScreenFormat(GFX_TOP)) {
+	switch (gfxGetScreenFormat(screen)) {
 		case GSP_RGBA8_OES:
 			output = GX_TRANSFER_FMT_RGBA8;
 			break;
@@ -235,10 +384,9 @@ static C3D_RenderTarget* TieN3ds_CreateTopTarget(gfx3dSide_t side) {
 			output = GX_TRANSFER_FMT_RGBA4;
 			break;
 	}
-	C3D_RenderTarget* target =
-		C3D_RenderTargetCreate(TIE_3DS_TOP_HEIGHT, TIE_3DS_TOP_WIDTH, GPU_RB_RGBA8, GPU_RB_DEPTH16);
+	C3D_RenderTarget* target = C3D_RenderTargetCreate(TIE_3DS_TOP_HEIGHT, width, GPU_RB_RGBA8, GPU_RB_DEPTH16);
 	if (target)
-		C3D_RenderTargetSetOutput(target, GFX_TOP, side,
+		C3D_RenderTargetSetOutput(target, screen, side,
 								  GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
 									  GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
 									  GX_TRANSFER_OUT_FORMAT(output) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
@@ -257,8 +405,9 @@ static bool TieN3ds_PresenterInit(void) {
 		return false;
 	}
 	C2D_Prepare();
-	s_presenter.left = TieN3ds_CreateTopTarget(GFX_LEFT);
-	s_presenter.right = TieN3ds_CreateTopTarget(GFX_RIGHT);
+	s_presenter.left = TieN3ds_CreateScreenTarget(GFX_TOP, GFX_LEFT, TIE_3DS_TOP_WIDTH);
+	s_presenter.right = TieN3ds_CreateScreenTarget(GFX_TOP, GFX_RIGHT, TIE_3DS_TOP_WIDTH);
+	s_presenter.bottom = TieN3ds_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT, TIE_3DS_BOTTOM_WIDTH);
 	C3D_Tex* textures = &s_presenter.textures[0][0];
 	const int texture_count = TIE_3DS_TEXTURE_SETS * 2;
 	int created = 0;
@@ -268,7 +417,7 @@ static bool TieN3ds_PresenterInit(void) {
 		memset(textures[created].data, 0, textures[created].size);
 		++created;
 	}
-	if (!s_presenter.left || !s_presenter.right || created < texture_count) {
+	if (!s_presenter.left || !s_presenter.right || !s_presenter.bottom || created < texture_count) {
 		while (created > 0)
 			C3D_TexDelete(&textures[--created]);
 		C2D_Fini();
@@ -332,14 +481,17 @@ static void TieN3ds_UploadFrame(const AeronPixelFrameView* frame) {
 	const int width = frame->width / step_x;
 	const int height = frame->height / step_y;
 	const bool stereo = s_stereo_mask && frame->width == s_stereo_width && frame->height == s_stereo_height;
+	const bool composite = !stereo && s_composite_mask && frame->width == s_composite_width &&
+						   frame->height == s_composite_height;
 	TieN3ds_WritePicture(TieN3ds_CurrentTexels(0), (const uint8_t*)frame->pixels, frame->pitch, step_x, step_y,
-						 width, height, palette, stereo ? s_stereo_mask : NULL);
+						 width, height, palette, stereo ? s_stereo_mask : composite ? s_composite_mask : NULL);
 	if (stereo)
 		TieN3ds_WritePicture(TieN3ds_CurrentTexels(1), s_stereo_right, frame->width, 1, 1, width, height, palette,
 							 s_stereo_mask);
 	s_presenter.frame_width = width;
 	s_presenter.frame_height = height;
 	s_presenter.frame_stereo = stereo;
+	s_presenter.frame_composite = composite;
 	s_presenter.frame_ready = true;
 }
 
@@ -352,9 +504,22 @@ static void TieN3ds_DrawEye(C3D_RenderTarget* target, int eye, float space_shift
 	const float scale_x = (float)TIE_3DS_PICTURE_WIDTH / (float)s_presenter.frame_width;
 	const float scale_y = (float)TIE_3DS_PICTURE_HEIGHT / (float)s_presenter.frame_height;
 	const float x = (float)TIE_3DS_PICTURE_X;
+	if (s_presenter.frame_composite) {
+		/* GPU content first; the classic cockpit and HUD (alpha 255) on top. */
+		if (s_eye_overlay)
+			s_eye_overlay(eye);
+		C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+		C3D_AlphaTest(true, GPU_GREATER, 0x7F);
+		C2D_DrawImageAt(image, x, 0.0f, 0.5f, NULL, scale_x, scale_y);
+		C2D_Flush();
+		C3D_AlphaTest(false, GPU_ALWAYS, 0);
+		return;
+	}
 	if (!s_presenter.frame_stereo) {
 		C2D_DrawImageAt(image, x, 0.0f, 0.5f, NULL, scale_x, scale_y);
 		C2D_Flush();
+		if (s_eye_overlay)
+			s_eye_overlay(eye);
 		return;
 	}
 	/* Replace rather than blend, so alpha only selects cockpit or space. */
@@ -368,6 +533,8 @@ static void TieN3ds_DrawEye(C3D_RenderTarget* target, int eye, float space_shift
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_SRC_ALPHA,
 				   GPU_ONE_MINUS_SRC_ALPHA);
+	if (s_eye_overlay)
+		s_eye_overlay(eye);
 }
 
 /* Far space sits behind the screen when each eye sees it displaced outward:
@@ -403,6 +570,12 @@ int Aeron_Present(void) {
 	TieN3ds_DrawEye(s_presenter.left, 0, output_3d ? -half : 0.0f);
 	if (output_3d)
 		TieN3ds_DrawEye(s_presenter.right, 1, half);
+	if (s_bottom_screen) {
+		C2D_TargetClear(s_presenter.bottom, C2D_Color32(0, 0, 0, 255));
+		C2D_SceneBegin(s_presenter.bottom);
+		s_bottom_screen();
+		C2D_Flush();
+	}
 	C3D_FrameEnd(0);
 	return 1;
 }

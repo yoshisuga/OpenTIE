@@ -19,6 +19,8 @@ typedef struct TieFlightStereoEyeCache {
 static float s_strength;
 static bool s_rendering_right_eye;
 static bool s_frame_ready;
+static bool s_capture_scene;
+static bool s_scene_ready;
 static int32_t s_offset_x, s_offset_y, s_offset_z;
 static uint8_t s_left_scene[TIE_FLIGHT_STEREO_WIDTH * TIE_FLIGHT_STEREO_HEIGHT];
 static uint8_t s_right_scene[TIE_FLIGHT_STEREO_WIDTH * TIE_FLIGHT_STEREO_HEIGHT];
@@ -30,6 +32,16 @@ static int32_t s_saved_right_extent[TIE_FLIGHT_STEREO_HEIGHT];
 
 void TieFlightStereo_SetStrength(float strength) {
 	s_strength = strength < 0.0f ? 0.0f : strength > 1.0f ? 1.0f : strength;
+}
+
+void TieFlightStereo_SetCaptureScene(bool capture) { s_capture_scene = capture; }
+
+bool TieFlightStereo_TakeScene(const uint8_t** scene) {
+	if (!s_scene_ready)
+		return false;
+	s_scene_ready = false;
+	*scene = s_left_scene;
+	return true;
 }
 
 void TieFlightStereo_OffsetCamera(void) {
@@ -72,6 +84,12 @@ static bool TieFlightStereo_PrepareOffset(void) {
 }
 
 void TieFlightStereo_AfterRender(void) {
+	if (!s_rendering_right_eye && s_capture_scene && s_strength <= 0.0f && flightResolution == TIE_FLIGHT_RES_VGA &&
+		screenMemWidth >= TIE_FLIGHT_STEREO_WIDTH && xtrans2_videobaseptr) {
+		TieFlightStereo_CopyFramebuffer(s_left_scene);
+		s_scene_ready = true;
+		return;
+	}
 	const size_t logbuf_size = (size_t)pixelswide * pixelsdeep;
 	if (s_rendering_right_eye || s_strength <= 0.0f || flightResolution != TIE_FLIGHT_RES_VGA ||
 		screenMemWidth < TIE_FLIGHT_STEREO_WIDTH || !xtrans2_videobaseptr || !buffer_ptr || !newstarptr ||

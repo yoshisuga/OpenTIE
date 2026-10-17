@@ -32,6 +32,8 @@ add_library(tie_3ds_aeron STATIC
     ${AERON_DIR}/src/vfs.c
     ${AERON_DIR}/src/vfs_iso9660.c
     ${AERON_DIR}/src/scene/settings.c
+    ${AERON_DIR}/src/scene/world.c
+    aeron_scene_math_3ds.c
     ${AERON_DIR}/src/compat/config.c
     ${AERON_DIR}/src/compat/dinput.c
     ${AERON_DIR}/src/compat/dsound.c
@@ -73,8 +75,17 @@ add_library(aeron_asset INTERFACE)
 target_link_libraries(aeron_asset INTERFACE tie_3ds_aeron)
 target_link_libraries(tie_core PRIVATE tie_3ds_aeron)
 
+# The flight vertex shader, assembled by picasso and linked in as
+# tie_3ds_flight_shbin (tie_3ds_flight_shbin.h).
+ctr_add_shader_library(tie_3ds_flight shaders/flight.v.pica)
+dkp_add_embedded_binary_library(tie_3ds_flight_shader tie_3ds_flight)
+
 add_executable(tie_3ds
     main_3ds.c
+    flight_gpu_3ds.c
+    touch_panel_3ds.c
+    settings_3ds.c
+    ${CMAKE_SOURCE_DIR}/src/tie_remaster/flight/render_math.c
     ${CMAKE_SOURCE_DIR}/src/tie_app/config/app_config.c
     ${CMAKE_SOURCE_DIR}/src/tie_app/config/controller_config.c
     ${CMAKE_SOURCE_DIR}/src/tie_app/config/keyboard_config.c
@@ -82,7 +93,7 @@ add_executable(tie_3ds
 set_target_properties(tie_3ds PROPERTIES OUTPUT_NAME "OpenTIE")
 target_include_directories(tie_3ds PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(tie_3ds PRIVATE TIE_VERSION_STRING="${TIE_DISPLAY_VERSION}")
-target_link_libraries(tie_3ds PRIVATE tie_core tie_3ds_aeron)
+target_link_libraries(tie_3ds PRIVATE tie_core tie_3ds_aeron tie_3ds_flight_shader)
 tie_enable_warnings(tie_3ds)
 
 # Application resources ship in romfs, which SDL reports as the base path.
