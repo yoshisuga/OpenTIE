@@ -263,13 +263,47 @@ typedef enum TieIosButtonKind {
 	TIE_IOS_BUTTON_WHEEL,    /* an action on a tap; hold or slide out for a wheel */
 } TieIosButtonKind;
 
+/* The screens a button shows on, as a mask. */
 typedef enum TieIosButtonPlace {
-	TIE_IOS_PLACE_ALWAYS, /* menus and flight */
-	TIE_IOS_PLACE_FLIGHT, /* the cockpit only */
-	TIE_IOS_PLACE_MENUS,  /* everywhere but the cockpit */
+	TIE_IOS_PLACE_MENUS = 1 << 0,  /* everything but the screens below */
+	TIE_IOS_PLACE_FLIGHT = 1 << 1, /* the cockpit */
+	TIE_IOS_PLACE_PAUSED = 1 << 2, /* the cockpit, paused */
+	TIE_IOS_PLACE_MAP = 1 << 3,    /* the in-flight map */
+	TIE_IOS_PLACE_ALWAYS = TIE_IOS_PLACE_MENUS | TIE_IOS_PLACE_FLIGHT | TIE_IOS_PLACE_PAUSED | TIE_IOS_PLACE_MAP,
 } TieIosButtonPlace;
 
 static const CFTimeInterval TIE_IOS_HOLD_SECONDS = 0.5;
+
+/* Each kind of control has a color, on its outline and as a soft fill.
+ * Amber is kept for open and holding, red in a wheel for danger. */
+typedef enum TieIosCategory {
+	TIE_IOS_CATEGORY_GAME,      /* gray: ESC, KEYS, PAUSE, OK, SKIP, MISSION, CHKPT */
+	TIE_IOS_CATEGORY_WEAPONS,   /* coral: FIRE, WPN, LINK */
+	TIE_IOS_CATEGORY_TARGETING, /* green: TGT and the target memories */
+	TIE_IOS_CATEGORY_FLIGHT,    /* blue: throttle, MATCH, ROLL, GYRO */
+	TIE_IOS_CATEGORY_POWER,     /* violet: recharge rates, transfers, shields */
+	TIE_IOS_CATEGORY_INFO,      /* teal: INFO, VIEW and CMD, and LOOK */
+} TieIosCategory;
+
+static UIColor* TieIos_CategoryColor(TieIosCategory category) {
+	switch (category) {
+		case TIE_IOS_CATEGORY_WEAPONS:
+			return [UIColor colorWithRed:1.00 green:0.42 blue:0.38 alpha:1.0];
+		case TIE_IOS_CATEGORY_TARGETING:
+			return [UIColor colorWithRed:0.45 green:0.85 blue:0.40 alpha:1.0];
+		case TIE_IOS_CATEGORY_FLIGHT:
+			return [UIColor colorWithRed:0.40 green:0.62 blue:1.00 alpha:1.0];
+		case TIE_IOS_CATEGORY_POWER:
+			return [UIColor colorWithRed:0.72 green:0.52 blue:1.00 alpha:1.0];
+		case TIE_IOS_CATEGORY_INFO:
+			return [UIColor colorWithRed:0.30 green:0.80 blue:0.85 alpha:1.0];
+		case TIE_IOS_CATEGORY_GAME:
+			break;
+	}
+	return [UIColor colorWithWhite:0.80 alpha:1.0];
+}
+
+static UIColor* TieIos_Amber(void) { return [UIColor colorWithRed:1.0 green:0.8 blue:0.3 alpha:0.95]; }
 static const CFTimeInterval TIE_IOS_WHEEL_SECONDS = 0.3;
 
 /* Haptics: a light tap as a wheel opens, a tick as its choice changes, a
@@ -356,7 +390,8 @@ static const CFTimeInterval TIE_IOS_WHEEL_ARM = 0.6; /* seconds on a dangerous c
 	self.moved = NO;
 	const CGSize size = self.bounds.size;
 	const CGSize pill = CGSizeMake(70.0, 30.0);
-	self.radius = MIN(110.0, size.height * 0.3);
+	/* Far enough out that the choices do not touch, within the screen. */
+	self.radius = MIN(MAX(110.0, titles.count * (pill.width + 6.0) / (2.0 * M_PI)), size.height * 0.36);
 	const CGFloat reach = self.radius + pill.width / 2 + 4.0;
 	self.hub = CGPointMake(MAX(reach, MIN(origin.x, size.width - reach)),
 						   MAX(self.radius + pill.height, MIN(origin.y, size.height - self.radius - pill.height)));
@@ -475,6 +510,10 @@ static const CFTimeInterval TIE_IOS_WHEEL_ARM = 0.6; /* seconds on a dangerous c
 @property(nonatomic) CFTimeInterval nextRepeat;
 @property(nonatomic, strong) UILabel* label;
 @property(nonatomic, copy) void (^toggle)(void);
+@property(nonatomic, strong) UIColor* tint;
+@property(nonatomic) BOOL open;
+/* MENU's icon: a plus while collapsed, turned to a cross while open. */
+@property(nonatomic, strong) UIImageView* chevron;
 /* A wheel button's ring: titles and the actions they send. */
 @property(nonatomic, strong) NSArray<NSString*>* choiceTitles;
 @property(nonatomic, strong) NSIndexSet* dangerousChoices;
@@ -502,7 +541,7 @@ static const CFTimeInterval TIE_IOS_WHEEL_ARM = 0.6; /* seconds on a dangerous c
 		_place = place;
 		self.multipleTouchEnabled = NO;
 		self.layer.borderWidth = 1.5;
-		self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
+		_tint = TieIos_CategoryColor(TIE_IOS_CATEGORY_GAME);
 		_label = [[UILabel alloc] initWithFrame:CGRectZero];
 		_label.text = title;
 		_label.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
@@ -512,8 +551,34 @@ static const CFTimeInterval TIE_IOS_WHEEL_ARM = 0.6; /* seconds on a dangerous c
 		_label.numberOfLines = 2;
 		[self addSubview:_label];
 		[self setHeld:NO];
+		[self restBorder];
 	}
 	return self;
+}
+
+- (void)addChevron {
+	UIImageSymbolConfiguration* weight = [UIImageSymbolConfiguration configurationWithWeight:UIImageSymbolWeightBold];
+	self.chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"plus" withConfiguration:weight]];
+	self.chevron.tintColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+	self.chevron.contentMode = UIViewContentModeScaleAspectFit;
+	[self addSubview:self.chevron];
+	[self setNeedsLayout];
+}
+
+- (void)turnChevron:(BOOL)open {
+	self.chevron.transform = open ? CGAffineTransformMakeRotation((CGFloat)M_PI_4) : CGAffineTransformIdentity;
+}
+
+- (void)setCategory:(TieIosCategory)category {
+	self.tint = TieIos_CategoryColor(category);
+	[self setHeld:self.held];
+	[self restBorder];
+}
+
+/* The outline at rest: amber while a group or toggle is open. */
+- (void)restBorder {
+	self.layer.borderWidth = self.open ? 2.5 : 1.5;
+	self.layer.borderColor = self.open ? TieIos_Amber().CGColor : [self.tint colorWithAlphaComponent:0.8].CGColor;
 }
 
 - (BOOL)hasHold {
@@ -579,18 +644,28 @@ static const CFTimeInterval TIE_IOS_WHEEL_ARM = 0.6; /* seconds on a dangerous c
 	self.layer.cornerRadius = MIN(self.bounds.size.width, self.bounds.size.height) * 0.5;
 	[self layoutHoldLayers];
 	_label.frame = CGRectInset(self.bounds, 4, 2);
+	if (self.chevron) {
+		/* The chevron to the right of the label; set its frame without its
+		 * turn, which may be mid-animation. */
+		const CGFloat size = MIN(12.0, self.bounds.size.height * 0.35);
+		const CGFloat inset = self.bounds.size.height * 0.35;
+		_label.frame = CGRectMake(inset * 0.6, 2, self.bounds.size.width - inset * 1.3 - size,
+								  self.bounds.size.height - 4);
+		self.chevron.bounds = CGRectMake(0, 0, size, size);
+		self.chevron.center = CGPointMake(self.bounds.size.width - inset * 0.55 - size / 2, CGRectGetMidY(self.bounds));
+	}
 	_label.font = [UIFont boldSystemFontOfSize:MAX(9.0, MIN(self.bounds.size.height * 0.28, 20.0))];
 }
 
 - (void)setHeld:(BOOL)held {
 	_held = held;
-	self.backgroundColor = [UIColor colorWithWhite:held ? 0.85 : 0.15 alpha:held ? 0.45 : 0.3];
+	self.backgroundColor = [self.tint colorWithAlphaComponent:held ? 0.55 : 0.18];
 }
 
 /* A group toggle shows whether its group is open. */
 - (void)setOpen:(BOOL)open {
-	self.layer.borderColor = open ? [UIColor colorWithRed:1.0 green:0.8 blue:0.3 alpha:0.9].CGColor
-								  : [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
+	_open = open;
+	[self restBorder];
 }
 
 static void TieIos_ToggleKeyboard(void) {
@@ -696,7 +771,7 @@ static void TieIos_Tap(TieInputAction action) {
 			} else if (!self.holdFired) {
 				TieIos_Tap(self.action);
 			}
-			self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
+			[self restBorder];
 			break;
 		case TIE_IOS_BUTTON_REPEAT:
 			self.nextRepeat = CACurrentMediaTime() + 0.35;
@@ -733,7 +808,7 @@ static void TieIos_Tap(TieInputAction action) {
 		[ios_haptic_notify notificationOccurred:UINotificationFeedbackTypeSuccess];
 		[self showHoldProgress:NO];
 		TieIos_Tap(self.holdAction);
-		self.layer.borderColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:0.9].CGColor;
+		self.layer.borderColor = UIColor.whiteColor.CGColor;
 	} else if (self.kind == TIE_IOS_BUTTON_REPEAT && now >= self.nextRepeat) {
 		TieInputActions_DispatchController(self.action, false);
 		TieInputActions_DispatchController(self.action, true);
@@ -797,12 +872,13 @@ static void TieIos_SetThrottleAxis(float value);
 
 - (instancetype)initWithFrame:(CGRect)frame {
 	if ((self = [super initWithFrame:frame])) {
+		UIColor* flight = TieIos_CategoryColor(TIE_IOS_CATEGORY_FLIGHT);
 		self.layer.borderWidth = 1.5;
-		self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
-		self.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.3];
+		self.layer.borderColor = [flight colorWithAlphaComponent:0.8].CGColor;
+		self.backgroundColor = [flight colorWithAlphaComponent:0.12];
 		self.clipsToBounds = YES;
 		_fill = [CALayer layer];
-		_fill.backgroundColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:0.35].CGColor;
+		_fill.backgroundColor = [flight colorWithAlphaComponent:0.4].CGColor;
 		_handle = [CALayer layer];
 		_handle.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.85].CGColor;
 		[self.layer addSublayer:_fill];
@@ -898,6 +974,12 @@ static void TieIos_SetThrottleAxis(float value);
 @property(nonatomic) BOOL flight;
 /* Paused in the cockpit: only PAUSE (to resume) joins ESC and KEYS. */
 @property(nonatomic) BOOL paused;
+/* The in-flight map: drag rotates or pans, pinch zooms. */
+@property(nonatomic) BOOL map;
+@property(nonatomic, strong) NSArray<TieTouchButton*>* mapRightButtons;
+@property(nonatomic, strong) NSArray<TieTouchButton*>* mapLeftButtons;
+/* The zoom a pinch holds: +1 in, -1 out, 0 none. */
+@property(nonatomic) int pinchZoom;
 @property(nonatomic, strong) TieTouchButton* pauseButton;
 @property(nonatomic, strong) TieTouchButton* skipButton;
 @property(nonatomic, strong) TieTouchButton* gyroButton;
@@ -913,6 +995,11 @@ static void TieIos_SetThrottleAxis(float value);
 @property(nonatomic, strong) NSArray<TieTouchButton*>* rightButtons;
 @property(nonatomic, strong) NSArray<TieTouchButton*>* topButtons;
 @property(nonatomic, strong) NSArray<TieTouchGroup*>* groups;
+/* MENU at the top center: its panel holds the game, info, view, wingman,
+ * mission and checkpoint controls; INFO and VIEW open below it. */
+@property(nonatomic, strong) TieTouchGroup* menuGroup;
+/* The strip behind MENU's line, which stretches out from the center. */
+@property(nonatomic, strong) UIView* menuBackdrop;
 @property(nonatomic, strong) TieTouchButton* fireButton;
 @property(nonatomic, strong) TieThrottleSlider* throttle;
 @property(nonatomic, weak) UITouch* stickTouch;
@@ -1075,11 +1162,40 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 			TieIos_Button(@"LINK", TIE_INPUT_ACTION_CYCLE_WEAPON_FIRING_MODE),
 			TieIos_Button(@"MATCH", TIE_INPUT_ACTION_MATCH_SPEED),
 			TieIos_Button(@"ROLL", TIE_INPUT_ACTION_TARGET_ROLL_THROTTLE_MODIFIER),
+			/* The map takes the same targeting keys. */
 			[self wheelButton:@"TGT"
 						  tap:TIE_INPUT_ACTION_TARGET_NEXT
 					   titles:@[ @"NEAR", @"ATKR", @"CHAIN", @"NEWEST", @"VIEW", @"COMP ▶", @"COMP ◀", @"CLEAR", @"PREV" ]
 					  actions:target_actions],
 		];
+		_rightButtons.lastObject.place = TIE_IOS_PLACE_FLIGHT | TIE_IOS_PLACE_MAP;
+		/* The map screen. Its zoom is the joystick's first two buttons, held;
+		 * Space switches the top and side views, 'c' centers on the target,
+		 * h, i, n and w cycle which craft are shown, and the arrow keys turn
+		 * the info pages. */
+		static const TieInputAction show_actions[] = {
+			TIE_INPUT_ACTION_HYPERSPACE,                /* 'h': hostile */
+			TIE_INPUT_ACTION_TOGGLE_COMPONENT_TRACKING, /* 'i': Imperial */
+			TIE_INPUT_ACTION_TOGGLE_SLAM,               /* 'n': neutral */
+			TIE_INPUT_ACTION_CYCLE_WEAPON_GROUP,        /* 'w': warheads */
+		};
+		TieTouchButton* show = [self wheelButton:@"SHOW"
+											 tap:TIE_INPUT_ACTION_NONE
+										  titles:@[ @"HOSTILE", @"IMPERIAL", @"NEUTRAL", @"WARHEADS" ]
+										 actions:show_actions];
+		_mapRightButtons = @[
+			TieIos_Button(@"ZOOM +", TIE_INPUT_ACTION_FIRE_WEAPON),
+			TieIos_Button(@"ZOOM −", TIE_INPUT_ACTION_TARGET_ROLL_THROTTLE_MODIFIER),
+			TieIos_Button(@"TOP /\nSIDE", TIE_INPUT_ACTION_CONFIRM),
+			TieIos_Button(@"CENTER", TIE_INPUT_ACTION_RECORDER_TOGGLE),
+			show,
+		];
+		_mapLeftButtons = @[
+			TieIos_Button(@"◀ INFO", TIE_INPUT_ACTION_ROLL_LEFT_INFO_PREVIOUS),
+			TieIos_Button(@"INFO ▶", TIE_INPUT_ACTION_ROLL_RIGHT_INFO_NEXT),
+		];
+		for (TieTouchButton* button in [_mapRightButtons arrayByAddingObjectsFromArray:_mapLeftButtons])
+			button.place = TIE_IOS_PLACE_MAP;
 		/* The look views, each placed in the direction it looks: clockwise
 		 * from straight up. */
 		static const TieInputAction look_actions[] = {
@@ -1087,8 +1203,8 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 			TIE_INPUT_ACTION_VIEW_RIGHT_SHOULDER, TIE_INPUT_ACTION_VIEW_REAR,        TIE_INPUT_ACTION_VIEW_LEFT_SHOULDER,
 			TIE_INPUT_ACTION_VIEW_LEFT_WING,    TIE_INPUT_ACTION_VIEW_LEFT_FORWARD,
 		};
-		/* The top row, between the scopes: PAUSE and OK, submenus that open
-		 * below it one at a time, and the mission and checkpoint wheels. */
+		/* Under MENU: PAUSE and OK, the INFO and VIEW submenus (one open at a
+		 * time), and the wingman, mission and checkpoint wheels. */
 		NSArray<TieTouchGroup*>* submenus = @[
 			[self groupWithTitle:@"INFO ▾"
 							 key:nil
@@ -1112,20 +1228,24 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 												  @"L FWD" ]
 									   actions:look_actions],
 						 ]],
-			[self groupWithTitle:@"CMD ▾"
-							 key:nil
-						 buttons:@[
-							 TieIos_Button(@"WING", TIE_INPUT_ACTION_INFO_WINGMAN_COMMANDS),
-							 TieIos_Button(@"ATK TGT", TIE_INPUT_ACTION_COMM_ASSIGN_TARGET),
-							 TieIos_Button(@"COVER", TIE_INPUT_ACTION_COMM_COVER_ME),
-							 TieIos_Button(@"REINF", TIE_INPUT_ACTION_COMM_REINFORCEMENTS),
-							 TieIos_Button(@"HYPER", TIE_INPUT_ACTION_HYPERSPACE),
-						 ]],
 		];
 		for (TieTouchGroup* group in submenus)
 			group.submenu = YES;
 		_groups = [_groups arrayByAddingObjectsFromArray:submenus];
 		_pauseButton = TieIos_Button(@"PAUSE", TIE_INPUT_ACTION_PAUSE);
+		/* Wingman orders: the WING screen on a tap; held, every order. */
+		static const TieInputAction command_actions[] = {
+			TIE_INPUT_ACTION_COMM_ASSIGN_TARGET,    TIE_INPUT_ACTION_COMM_COVER_ME,
+			TIE_INPUT_ACTION_COMM_EVADE,            TIE_INPUT_ACTION_COMM_IGNORE_TARGET,
+			TIE_INPUT_ACTION_COMM_STOP_AND_WAIT,    TIE_INPUT_ACTION_COMM_CONTINUE_MISSION,
+			TIE_INPUT_ACTION_COMM_HEAD_HOME,        TIE_INPUT_ACTION_COMM_REPORT_ORDERS,
+			TIE_INPUT_ACTION_COMM_REQUEST_RESUPPLY, TIE_INPUT_ACTION_COMM_REINFORCEMENTS,
+		};
+		TieTouchButton* command = [self wheelButton:@"CMD"
+												tap:TIE_INPUT_ACTION_INFO_WINGMAN_COMMANDS
+											 titles:@[ @"ATTACK", @"COVER", @"EVADE", @"IGNORE", @"WAIT", @"GO ON", @"HOME",
+													   @"REPORT", @"RESUPPLY", @"REINF" ]
+											actions:command_actions];
 		/* Time compression on a tap; held, the rest of the mission, with
 		 * ejecting and ending it only after resting on them. */
 		static const TieInputAction mission_actions[] = {
@@ -1159,15 +1279,39 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 					[empty addIndex:5 - slot];
 			return empty;
 		};
-		_topButtons = @[
-			_pauseButton,
-			TieIos_Button(@"OK", TIE_INPUT_ACTION_CONFIRM),
-			submenus[0].toggle,
-			submenus[1].toggle,
-			submenus[2].toggle,
-			mission,
-			checkpoint,
-		];
+		_menuGroup = [self groupWithTitle:@"MENU"
+									  key:@"TieIosMenuOpen"
+								  buttons:@[
+									  _pauseButton,
+									  TieIos_Button(@"OK", TIE_INPUT_ACTION_CONFIRM),
+									  submenus[0].toggle,
+									  submenus[1].toggle,
+									  command,
+									  mission,
+									  checkpoint,
+								  ]];
+		[_menuGroup.toggle addChevron];
+		[_menuGroup.toggle turnChevron:_menuGroup.open];
+		__weak TieTouchOverlay* weak_overlay = self;
+		_menuGroup.toggle.toggle = ^{
+			[weak_overlay toggleMenu];
+		};
+		/* The menu panel itself is clear: its strip is a view that can
+		 * stretch on its own, and MENU sits on top of both. */
+		_menuBackdrop = [[UIView alloc] initWithFrame:CGRectZero];
+		_menuBackdrop.backgroundColor = _menuGroup.panel.backgroundColor;
+		_menuBackdrop.layer.cornerRadius = _menuGroup.panel.layer.cornerRadius;
+		_menuBackdrop.userInteractionEnabled = NO;
+		_menuGroup.panel.backgroundColor = UIColor.clearColor;
+		[_menuGroup.panel insertSubview:_menuBackdrop atIndex:0];
+		/* Its panel goes under the submenus' panels. */
+		NSMutableArray<TieTouchGroup*>* groups = [_groups mutableCopy];
+		[groups insertObject:_menuGroup atIndex:groups.count - submenus.count];
+		_groups = groups;
+		/* While paused, RESUME takes MENU's place. */
+		TieTouchButton* resume = TieIos_Button(@"RESUME", TIE_INPUT_ACTION_PAUSE);
+		resume.place = TIE_IOS_PLACE_PAUSED;
+		_topButtons = @[ _menuGroup.toggle, resume ];
 		_fireButton = TieIos_Button(@"FIRE", TIE_INPUT_ACTION_FIRE_WEAPON);
 		NSMutableArray<TieTouchButton*>* all = [NSMutableArray array];
 		[all addObjectsFromArray:_leftButtons];
@@ -1175,6 +1319,8 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 		[all addObjectsFromArray:_topButtons];
 		[all addObject:_fireButton];
 		[all addObject:_skipButton];
+		[all addObjectsFromArray:_mapRightButtons];
+		[all addObjectsFromArray:_mapLeftButtons];
 		for (TieTouchButton* button in all)
 			[self addSubview:button];
 		for (TieTouchGroup* group in _groups) {
@@ -1182,8 +1328,11 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 			[all addObjectsFromArray:group.buttons];
 		}
 		_buttons = all;
+		for (TieTouchButton* button in _topButtons)
+			[self bringSubviewToFront:button];
 		_throttle = [[TieThrottleSlider alloc] initWithFrame:CGRectZero];
 		[self addSubview:_throttle];
+		[self colorButtons];
 		[self addSubview:_wheel];
 		_toast = [[UILabel alloc] initWithFrame:CGRectZero];
 		_toast.textAlignment = NSTextAlignmentCenter;
@@ -1205,10 +1354,61 @@ static TieTouchButton* TieIos_PresetButton(NSString* title, TieInputAction recal
 		_stickKnob.fillColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
 		[self.layer addSublayer:_stickBase];
 		[self.layer addSublayer:_stickKnob];
+		/* A pinch on the map zooms it. */
+		UIPinchGestureRecognizer* pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self
+																				   action:@selector(pinch:)];
+		pinch.delegate = (id<UIGestureRecognizerDelegate>)self;
+		[self addGestureRecognizer:pinch];
+		/* Two fingers dragged on the map pan it. */
+		UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
+																			  action:@selector(panMap:)];
+		pan.minimumNumberOfTouches = 2;
+		pan.maximumNumberOfTouches = 2;
+		pan.delegate = (id<UIGestureRecognizerDelegate>)self;
+		[self addGestureRecognizer:pan];
 		_flight = YES;
-		[self setFlight:NO paused:NO];
+		[self setFlight:NO paused:NO map:NO];
 	}
 	return self;
+}
+
+/* Every button not named here is a game control, in gray. */
+- (void)colorButtons {
+	NSDictionary<NSString*, NSNumber*>* categories = @{
+		@"FIRE" : @(TIE_IOS_CATEGORY_WEAPONS),
+		@"WPN" : @(TIE_IOS_CATEGORY_WEAPONS),
+		@"LINK" : @(TIE_IOS_CATEGORY_WEAPONS),
+		@"TGT" : @(TIE_IOS_CATEGORY_TARGETING),
+		@"MEM" : @(TIE_IOS_CATEGORY_TARGETING),
+		@"THR+" : @(TIE_IOS_CATEGORY_FLIGHT),
+		@"THR−" : @(TIE_IOS_CATEGORY_FLIGHT),
+		@"MATCH" : @(TIE_IOS_CATEGORY_FLIGHT),
+		@"ROLL" : @(TIE_IOS_CATEGORY_FLIGHT),
+		@"GYRO" : @(TIE_IOS_CATEGORY_FLIGHT),
+		@"PWR" : @(TIE_IOS_CATEGORY_POWER),
+		@"CMD" : @(TIE_IOS_CATEGORY_INFO),
+	};
+	for (TieTouchButton* button in [self.mapRightButtons arrayByAddingObjectsFromArray:self.mapLeftButtons])
+		[button setCategory:TIE_IOS_CATEGORY_INFO];
+	for (TieTouchButton* button in self.buttons) {
+		NSNumber* category = categories[button.label.text];
+		if (category)
+			[button setCategory:(TieIosCategory)category.integerValue];
+	}
+	/* A group's buttons take its toggle's color: power, the target
+	 * memories, and teal for the INFO, VIEW and CMD submenus. */
+	for (TieTouchGroup* group in self.groups) {
+		/* The MENU panel holds controls of several kinds, colored above. */
+		if (group == self.menuGroup)
+			continue;
+		if (group.submenu)
+			[group.toggle setCategory:TIE_IOS_CATEGORY_INFO];
+		const TieIosCategory category = group.submenu ? TIE_IOS_CATEGORY_INFO
+							  : [group.toggle.label.text isEqualToString:@"PWR"] ? TIE_IOS_CATEGORY_POWER
+																			: TIE_IOS_CATEGORY_TARGETING;
+		for (TieTouchButton* button in group.buttons)
+			[button setCategory:category];
+	}
 }
 
 - (CGFloat)stickRadius {
@@ -1275,7 +1475,7 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 
 	/* Each power or memory panel opens beside its toggle, inside the screen. */
 	for (TieTouchGroup* group in self.groups) {
-		if (group.submenu)
+		if (group.submenu || group == self.menuGroup)
 			continue;
 		const NSUInteger rows = (group.buttons.count + 1) / 2;
 		const CGSize panel = CGSizeMake(column_width + gap * 2, rows * (cell + gap) + gap);
@@ -1286,27 +1486,47 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 	}
 
 	TieIos_LayoutPairs(self.rightButtons, right_x, top, cell, gap);
+	/* The map's buttons fill the rows above TGT and the left bar's free
+	 * slots. */
+	TieIos_LayoutPairs(self.mapRightButtons, right_x, top, cell, gap);
+	for (NSUInteger index = 0; index < self.mapLeftButtons.count; ++index)
+		self.mapLeftButtons[index].frame = self.leftButtons[2 + index].frame;
 	const CGFloat fire_top = top + right_rows * (cell + gap);
 	const CGFloat fire = MIN(column_width, CGRectGetMaxY(area) - gap - fire_top);
 	self.fireButton.frame = CGRectMake(right_x + (column_width - fire) / 2, fire_top, fire, fire);
 
-	/* One row across the middle of the picture's top edge; a submenu opens
-	 * as a row below its toggle. */
-	const NSUInteger row_count = self.topButtons.count;
+	/* MENU at the top center, always. Open, its buttons sit on the same
+	 * line either side of it, the first half to its left; a submenu opens
+	 * as a row below, under its toggle. */
 	const CGFloat row_height = MAX(28.0, MIN(36.0, area.size.height * 0.08));
-	const CGFloat row_width = MIN(80.0, (game.size.width * 0.7 - gap * (row_count - 1)) / row_count);
-	const CGFloat row_x = CGRectGetMidX(game) - (row_width * row_count + gap * (row_count - 1)) / 2;
-	for (NSUInteger index = 0; index < row_count; ++index)
-		self.topButtons[index].frame =
-			CGRectMake(row_x + index * (row_width + gap), top, row_width, row_height);
+	const CGFloat menu_width = 84.0;
+	const NSUInteger menu_count = self.menuGroup.buttons.count;
+	const NSUInteger left_count = menu_count / 2;
+	const CGFloat row_width =
+		MIN(80.0, (game.size.width * 0.94 - menu_width - gap * (menu_count + 1)) / menu_count);
+	const CGRect menu = CGRectMake(CGRectGetMidX(game) - menu_width / 2, top, menu_width, row_height);
+	for (TieTouchButton* button in self.topButtons)
+		button.frame = menu;
+	const CGFloat left_edge = CGRectGetMinX(menu) - gap - left_count * (row_width + gap);
+	const CGFloat right_edge = CGRectGetMaxX(menu) + gap + (menu_count - left_count) * (row_width + gap);
+	self.menuGroup.panel.frame = CGRectMake(left_edge, top - gap, right_edge - left_edge, row_height + gap * 2);
+	self.menuBackdrop.frame = self.menuGroup.panel.bounds;
+	for (NSUInteger index = 0; index < menu_count; ++index) {
+		const CGFloat x = index < left_count ? gap + index * (row_width + gap)
+											 : CGRectGetMaxX(menu) - left_edge + gap +
+												   (index - left_count) * (row_width + gap);
+		self.menuGroup.buttons[index].frame = CGRectMake(x, gap, row_width, row_height);
+	}
 	for (TieTouchGroup* group in self.groups) {
 		if (!group.submenu)
 			continue;
 		const NSUInteger count = group.buttons.count;
 		const CGSize panel = CGSizeMake(count * (row_width + gap) + gap, row_height + gap * 2);
-		CGFloat x = CGRectGetMidX(group.toggle.frame) - panel.width / 2;
+		const CGRect toggle = [group.toggle.superview convertRect:group.toggle.frame toView:self];
+		CGFloat x = CGRectGetMidX(toggle) - panel.width / 2;
 		x = MAX(CGRectGetMinX(game) + gap, MIN(x, CGRectGetMaxX(game) - gap - panel.width));
-		group.panel.frame = CGRectMake(x, CGRectGetMaxY(group.toggle.frame) + gap, panel.width, panel.height);
+		group.panel.frame =
+			CGRectMake(x, CGRectGetMaxY(self.menuGroup.panel.frame) + gap, panel.width, panel.height);
 		for (NSUInteger index = 0; index < count; ++index)
 			group.buttons[index].frame =
 				CGRectMake(gap + index * (row_width + gap), gap, row_width, row_height);
@@ -1333,10 +1553,7 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 
 - (void)updateVisibility {
 	for (TieTouchButton* button in self.buttons) {
-		BOOL visible = button.place == TIE_IOS_PLACE_MENUS
-						   ? !self.flight && !self.paused
-						   : button.place == TIE_IOS_PLACE_ALWAYS || self.flight ||
-								 (self.paused && button == self.pauseButton);
+		BOOL visible = (button.place & [self screen]) != 0;
 		for (TieTouchGroup* group in self.groups)
 			if ([group.buttons containsObject:button])
 				visible = visible && group.open;
@@ -1345,20 +1562,181 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 		button.hidden = !visible;
 	}
 	for (TieTouchGroup* group in self.groups) {
-		group.panel.hidden = !(self.flight && group.open);
+		group.panel.hidden = group.toggle.hidden || !group.open;
 		[group.toggle setOpen:group.open];
 	}
 	self.throttle.hidden = !self.flight;
 }
 
-- (void)setFlight:(BOOL)flight paused:(BOOL)paused {
-	if (flight == _flight && paused == _paused)
+- (TieIosButtonPlace)screen {
+	return self.flight ? TIE_IOS_PLACE_FLIGHT
+		   : self.paused ? TIE_IOS_PLACE_PAUSED
+		   : self.map	 ? TIE_IOS_PLACE_MAP
+						 : TIE_IOS_PLACE_MENUS;
+}
+
+/* The flight stick works in the cockpit and on the map. */
+- (BOOL)stickActive {
+	return self.flight || self.map;
+}
+
+- (void)setFlight:(BOOL)flight paused:(BOOL)paused map:(BOOL)map {
+	if (flight == _flight && paused == _paused && map == _map)
 		return;
 	_flight = flight;
 	_paused = paused;
+	_map = map;
+	[self setPinchZoom:0];
 	[self updateVisibility];
-	if (!flight)
+	if (![self stickActive])
 		[self endStick];
+}
+
+/* MENU's buttons fan out from behind it to either side, nearest first,
+ * as the strip behind them stretches from the center; closing draws them
+ * back in. */
+- (void)toggleMenu {
+	TieTouchGroup* menu = self.menuGroup;
+	const BOOL open = !menu.open;
+	[[NSUserDefaults standardUserDefaults] setBool:open forKey:menu.key];
+	[self layoutIfNeeded];
+	UIView* panel = menu.panel;
+	const CGPoint hub = [self convertPoint:menu.toggle.center toView:panel];
+	const CGFloat strip = menu.toggle.bounds.size.width / MAX(1.0, panel.bounds.size.width);
+	/* Each button tucked behind MENU, small and clear. */
+	CGAffineTransform (^tucked)(TieTouchButton*) = ^CGAffineTransform(TieTouchButton* button) {
+		const CGAffineTransform shrink = CGAffineTransformMakeScale(0.3, 0.3);
+		return CGAffineTransformConcat(shrink, CGAffineTransformMakeTranslation(hub.x - button.center.x,
+																				  hub.y - button.center.y));
+	};
+	NSArray<TieTouchButton*>* buttons = menu.buttons;
+	/* Nearest to MENU first: its distance in buttons. */
+	NSUInteger (^rank)(NSUInteger) = ^NSUInteger(NSUInteger index) {
+		const NSUInteger left = buttons.count / 2;
+		return index < left ? left - 1 - index : index - left;
+	};
+	if (open) {
+		menu.open = YES;
+		[self updateVisibility];
+		self.menuBackdrop.transform = CGAffineTransformMakeScale(strip, 1.0);
+		for (TieTouchButton* button in buttons) {
+			button.transform = tucked(button);
+			button.alpha = 0.0;
+		}
+		[UIView animateWithDuration:0.22
+						 animations:^{
+							 self.menuBackdrop.transform = CGAffineTransformIdentity;
+							 [menu.toggle turnChevron:YES];
+						 }];
+		for (NSUInteger index = 0; index < buttons.count; ++index)
+			[UIView animateWithDuration:0.32
+								  delay:0.03 * rank(index)
+				 usingSpringWithDamping:0.75
+				  initialSpringVelocity:0.0
+								options:UIViewAnimationOptionBeginFromCurrentState
+							 animations:^{
+								 buttons[index].transform = CGAffineTransformIdentity;
+								 buttons[index].alpha = 1.0;
+							 }
+							 completion:nil];
+		return;
+	}
+	NSMutableArray<UIView*>* rows = [NSMutableArray array];
+	for (TieTouchGroup* group in self.groups)
+		if (group.submenu && !group.panel.hidden)
+			[rows addObject:group.panel];
+	[UIView animateWithDuration:0.2
+		animations:^{
+			self.menuBackdrop.transform = CGAffineTransformMakeScale(strip, 1.0);
+			for (TieTouchButton* button in buttons) {
+				button.transform = tucked(button);
+				button.alpha = 0.0;
+			}
+			for (UIView* row in rows)
+				row.alpha = 0.0;
+			[menu.toggle turnChevron:NO];
+		}
+		completion:^(BOOL finished) {
+			(void)finished;
+			menu.open = NO;
+			[self updateVisibility];
+			self.menuBackdrop.transform = CGAffineTransformIdentity;
+			for (TieTouchButton* button in buttons) {
+				button.transform = CGAffineTransformIdentity;
+				button.alpha = 1.0;
+			}
+			for (UIView* row in rows)
+				row.alpha = 1.0;
+		}];
+}
+
+/* Hold the map's zoom in (+1), out (-1) or neither, as its zoom buttons do. */
+- (void)setPinchZoom:(int)zoom {
+	if (zoom == _pinchZoom)
+		return;
+	if (_pinchZoom)
+		TieInputActions_DispatchController(_pinchZoom > 0 ? TIE_INPUT_ACTION_FIRE_WEAPON
+														  : TIE_INPUT_ACTION_TARGET_ROLL_THROTTLE_MODIFIER,
+										   false);
+	_pinchZoom = zoom;
+	if (zoom)
+		TieInputActions_DispatchController(zoom > 0 ? TIE_INPUT_ACTION_FIRE_WEAPON
+													: TIE_INPUT_ACTION_TARGET_ROLL_THROTTLE_MODIFIER,
+										   true);
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer*)recognizer shouldReceiveTouch:(UITouch*)touch {
+	return self.map && touch.view == self;
+}
+
+/* Pinch and two-finger pan together: zoom and pan at once. */
+- (BOOL)gestureRecognizer:(UIGestureRecognizer*)recognizer
+	shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer*)other {
+	return YES;
+}
+
+/* The map pans a fixed step per number key (the numeric keypad's
+ * directions), as when the key was held on DOS. Each 14 points the fingers
+ * travel sends one step, moving the map with them: the camera goes the
+ * other way. */
+- (void)panMap:(UIPanGestureRecognizer*)recognizer {
+	static const CGFloat step = 14.0;
+	/* Camera direction, clockwise from screen-right: the keypad keys. */
+	static const TieInputAction keys[8] = {
+		TIE_INPUT_ACTION_VIEW_RIGHT_WING,    /* '6' */
+		TIE_INPUT_ACTION_VIEW_RIGHT_SHOULDER, /* '3' */
+		TIE_INPUT_ACTION_VIEW_REAR,          /* '2' */
+		TIE_INPUT_ACTION_VIEW_LEFT_SHOULDER,  /* '1' */
+		TIE_INPUT_ACTION_VIEW_LEFT_WING,     /* '4' */
+		TIE_INPUT_ACTION_VIEW_LEFT_FORWARD,  /* '7' */
+		TIE_INPUT_ACTION_VIEW_FORWARD,       /* '8' */
+		TIE_INPUT_ACTION_VIEW_RIGHT_FORWARD, /* '9' */
+	};
+	if (recognizer.state != UIGestureRecognizerStateBegan && recognizer.state != UIGestureRecognizerStateChanged)
+		return;
+	[self endStick];
+	const CGPoint moved = [recognizer translationInView:self];
+	if (hypot(moved.x, moved.y) < step)
+		return;
+	const double angle = atan2(-moved.y, -moved.x);
+	const long sector = ((lround(angle / (M_PI / 4.0)) % 8) + 8) % 8;
+	TieIos_Tap(keys[sector]);
+	[recognizer setTranslation:CGPointZero inView:self];
+}
+
+/* Spreading the fingers zooms in, closing them zooms out, for as long as
+ * they keep moving. */
+- (void)pinch:(UIPinchGestureRecognizer*)recognizer {
+	switch (recognizer.state) {
+		case UIGestureRecognizerStateBegan:
+		case UIGestureRecognizerStateChanged:
+			[self endStick];
+			[self setPinchZoom:recognizer.velocity > 0.2 ? 1 : recognizer.velocity < -0.2 ? -1 : 0];
+			break;
+		default:
+			[self setPinchZoom:0];
+			break;
+	}
 }
 
 - (void)followThrottle:(CGFloat)value {
@@ -1383,10 +1761,11 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 		[button tick:now];
 }
 
-/* Outside flight the overlay passes every touch but its buttons to SDL. */
+/* Outside flight and the map, the overlay passes every touch but its
+ * buttons to SDL. */
 - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
 	UIView* hit = [super hitTest:point withEvent:event];
-	return hit == self && !self.flight ? nil : hit;
+	return hit == self && ![self stickActive] ? nil : hit;
 }
 
 - (void)drawStickAt:(CGPoint)point {
@@ -1434,7 +1813,7 @@ static void TieIos_LayoutPairs(NSArray<TieTouchButton*>* buttons, CGFloat x, CGF
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
 	ios_controller_in_use = false;
 	for (UITouch* touch in touches) {
-		if (self.stickTouch || !self.flight)
+		if (self.stickTouch || ![self stickActive])
 			break;
 		self.stickTouch = touch;
 		self.stickOrigin = [touch locationInView:self];
@@ -1543,7 +1922,9 @@ void TieIos_Frame(void) {
 						 snapshot->flight_screen == TIE_FLIGHT_SCREEN_NORMAL && !TieSettings_Open();
 	const bool paused = cockpit && TieFlightPause_IsActive();
 	const bool flight = cockpit && !paused;
-	[ios_overlay setFlight:flight paused:paused];
+	const bool map = snapshot && snapshot->scene_kind == TIE_SCENE_FLIGHT &&
+					 snapshot->flight_screen == TIE_FLIGHT_SCREEN_MAP && !TieSettings_Open();
+	[ios_overlay setFlight:flight paused:paused map:map];
 	const TiePresentationLayout* presentation = TiePresentation_Layout();
 	if (presentation && presentation->frame.width > 0)
 		[ios_overlay setGameX:(CGFloat)presentation->modern.x / presentation->frame.width

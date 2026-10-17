@@ -30,6 +30,10 @@ included.
     Choices shown in red, such as eject and loading a checkpoint, must be
     rested on until they turn bright red. The phone ticks as the choice
     changes.
+  - **Colors:** each kind of control has a color: weapons coral, targeting
+    green, flying blue, power violet, info and views teal, and game controls
+    gray. Amber marks something open or a hold filling; red, in a wheel, a
+    dangerous choice.
   - **Right bar:** THR+ and THR− (hold to repeat), WPN, LINK, MATCH, ROLL,
     TGT and FIRE. TGT takes the next target on a tap; its wheel has the
     nearest craft, my attacker, my target's attacker, the newest craft, the
@@ -40,20 +44,26 @@ included.
     recharge rates, transfers between lasers and shields, shield mode and
     beam on/off; and target memories T1–T3 (tap to recall, hold to store).
     The engines get the power the recharge rates leave, as in the original.
-  - **Top row:** PAUSE, OK (confirm), submenus INFO (map, goals, messages,
-    damage), VIEW (cockpit, external camera and its controls, missile camera,
-    and LOOK: forward on a tap, a wheel of the views all around) and CMD
-    (wingman orders, reinforcements, hyperspace), then two wheels. MISSION
-    cycles time compression on a tap; its wheel has hyperspace, the flight
-    recorder, eject and end mission. CHKPT saves a checkpoint to the slot
-    used last; its wheel saves to and loads slots 1–3.
+  - **MENU** (top center): its buttons fan out on the same line either side
+    of it: PAUSE, OK (confirm), INFO (map, goals, messages, damage), VIEW
+    (cockpit, external camera and its controls, missile camera, and LOOK:
+    forward on a tap, a wheel of the views all around), CMD (the wingman
+    screen on a tap; its wheel has every wingman order), MISSION (time
+    compression on a tap; its wheel has hyperspace, the flight recorder,
+    eject and end mission) and CHKPT (a checkpoint to the slot used last on
+    a tap; its wheel saves to and loads slots 1–3). INFO and VIEW open a row
+    below. While paused, RESUME takes MENU's place.
+  - **Map:** one finger rotates the view (or pans it in the other view),
+    two fingers pan it and a pinch zooms. Beside it: ZOOM + and −, TOP/SIDE,
+    CENTER on the target, SHOW (which craft are shown), TGT, and the info
+    pages.
   - **Checkpoints:** a checkpoint is the flight recorder's own snapshot of the
     flight, with the random-number state, kept for the mission it was saved
     in (`src/tie_runtime/runtime/quicksave.c`). A slot from another mission is
     shown empty.
   - **Menus and briefings:** ESC, KEYS and SKIP; tap anywhere else to click.
     A tap ends the current cutscene scene; SKIP (Enter) skips the sequence.
-  - **Paused:** PAUSE stays to resume.
+  - **Paused:** RESUME, in place of MENU, unpauses.
   - **Game controllers:** the touch controls step aside when a controller is
     used, and come back on the next touch.
 
